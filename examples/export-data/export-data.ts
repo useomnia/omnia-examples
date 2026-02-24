@@ -318,7 +318,7 @@ class OmniaApiClient {
     endpoint: string,
     params: Record<string, string> = {},
   ): Promise<T> {
-    return this.fetch<T>(this.buildUrl(endpoint, params));
+    return this.request<T>(this.buildUrl(endpoint, params));
   }
 
   async fetchAllPages<TItem>(
@@ -335,7 +335,7 @@ class OmniaApiClient {
     });
 
     while (nextUrl) {
-      const page = await this.fetch<Page>(nextUrl);
+      const page = await this.request<Page>(nextUrl);
       allItems.push(...(page.data[dataKey] ?? []));
       nextUrl = page.links.next;
     }
@@ -345,10 +345,10 @@ class OmniaApiClient {
 
   // -- Core fetch with retry logic ----------------------------------------
 
-  private async fetch<T>(url: string, retries = 0): Promise<T> {
+  private async request<T>(url: string, retries = 0): Promise<T> {
     this.checkCircuitBreaker();
 
-    const response = await globalThis.fetch(url, {
+    const response = await fetch(url, {
       method: "GET",
       headers: this.headers,
     });
@@ -388,7 +388,7 @@ class OmniaApiClient {
       `  429 on ${url}. Retry-After: ${seconds}s (attempt ${retries + 1}/${MAX_RETRIES})`,
     );
     await sleep(seconds * 1000);
-    return this.fetch<T>(url, retries + 1);
+    return this.request<T>(url, retries + 1);
   }
 
   private async retryWithBackoff<T>(
@@ -410,7 +410,7 @@ class OmniaApiClient {
       `  ${status} on ${url}. Backing off ${seconds}s (attempt ${retries + 1}/${MAX_RETRIES})`,
     );
     await sleep(seconds * 1000);
-    return this.fetch<T>(url, retries + 1);
+    return this.request<T>(url, retries + 1);
   }
 
   // -- Helpers ------------------------------------------------------------
