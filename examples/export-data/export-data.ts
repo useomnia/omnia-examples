@@ -20,24 +20,13 @@ import fs from "node:fs";
 import path from "node:path";
 
 // ---------------------------------------------------------------------------
-// Types — API Response Shapes
+// Types
 // ---------------------------------------------------------------------------
-
-interface ApiPagination {
-  page: number;
-  pageSize: number;
-  totalItems: number;
-}
-
-interface PaginationLinks {
-  prev?: string;
-  next?: string;
-}
 
 interface PaginatedResponse<T> {
   data: T;
-  pagination: ApiPagination;
-  links: PaginationLinks;
+  pagination: { page: number; pageSize: number; totalItems: number };
+  links: { prev?: string; next?: string };
 }
 
 interface SingleResponse<T> {
@@ -48,79 +37,26 @@ interface ApiError {
   error: { code: number; description: string };
 }
 
-// ---------------------------------------------------------------------------
-// Types — Domain Entities
-// ---------------------------------------------------------------------------
-
 interface Brand {
   id: string;
   name: string;
   domain: string;
-  mainLocation: string | null;
-  createdAt: string;
 }
 
 interface Topic {
   id: string;
   name: string;
-  location: string;
-  status: string;
-  tags: string[];
-  topicSource: string;
-  topicType: string;
-  createdAt: string;
 }
 
 interface Prompt {
   id: string;
   query: string;
   topicId: string;
-  isMonitoringActive: boolean;
-  location: string;
-  tags: string[];
-  createdAt: string;
 }
-
-// ---------------------------------------------------------------------------
-// Types — Flat Export Rows (Denormalized for BI)
-//
-// Each level extends the previous with additional context columns.
-// This ensures every row is self-contained for BI tools. No joins needed.
-// ---------------------------------------------------------------------------
 
 type FlatRow = Record<string, string | number | boolean | null>;
-
-// ---------------------------------------------------------------------------
-// Types — Export Manifest
-// ---------------------------------------------------------------------------
-
-interface ExportManifest {
-  exportedAt: string;
-  apiBaseUrl: string;
-  dateRange: { startDate: string; endDate: string };
-  brand: { id: string; name: string; domain: string };
-  topics: Array<{ id: string; name: string }>;
-  prompts: Array<{ id: string; query: string; topicId: string }>;
-  stats: {
-    totalApiCalls: number;
-    durationMs: number;
-    rowCounts: {
-      brand: MetricRowCounts;
-      topic: MetricRowCounts;
-      prompt: MetricRowCounts;
-    };
-  };
-}
-
-interface MetricRowCounts {
-  shareOfVoice: number;
-  visibility: number;
-  citations: number;
-}
-
-// ---------------------------------------------------------------------------
-// Types — CLI Configuration
-// ---------------------------------------------------------------------------
+type MetricType = "share-of-voice" | "visibility" | "citations";
+type EntityLevel = "brand" | "topic" | "prompt";
 
 interface ExportConfig {
   apiKey: string;
@@ -134,22 +70,11 @@ interface ExportConfig {
   concurrency: number;
 }
 
-// ---------------------------------------------------------------------------
-// Types — Internal
-// ---------------------------------------------------------------------------
-
-interface PromptWithTopic extends Prompt {
-  topicName: string;
-}
-
 interface EntityContext {
   brand: Brand;
   topics: Topic[];
-  prompts: PromptWithTopic[];
+  prompts: Array<Prompt & { topicName: string }>;
 }
-
-type MetricType = "share-of-voice" | "visibility" | "citations";
-type EntityLevel = "brand" | "topic" | "prompt";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -561,9 +486,10 @@ async function discoverEntities(
         `/topics/${topic.id}/prompts`,
         "prompts",
       );
-      return prompts.map(
-        (p): PromptWithTopic => ({ ...p, topicName: topic.name }),
-      );
+      return prompts.map((p): Prompt & { topicName: string } => ({
+        ...p,
+        topicName: topic.name,
+      }));
     },
   );
 
@@ -578,31 +504,10 @@ async function discoverEntities(
 }
 
 // ---------------------------------------------------------------------------
-// Aggregate Fetching — Generic fetcher for any entity level and metric
-// ---------------------------------------------------------------------------
-
-function fetchAggregates<T>(
-  client: OmniaApiClient,
-  basePath: string,
-  metric: MetricType,
-  date: string,
-): Promise<T[]> {
-  return client.fetchAllPages<T>(
-    `${basePath}/${metric}/aggregates`,
-    "aggregates",
-    {
-      startDate: date,
-      endDate: date,
-    },
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Row Flattening — Transform API aggregates into denormalized export rows
+// Row Flattening
 //
-// Each metric has a rename map that translates API field names into
-// BI-friendly column names (e.g. "brand" -> "mentionedBrand" to avoid
-// ambiguity with the exported brand). Fields not in the map are kept as-is.
+// Rename API fields to avoid ambiguity (e.g. "brand" -> "mentionedBrand"
+// so it doesn't clash with the exported brand). Fields not renamed pass through.
 // ---------------------------------------------------------------------------
 
 const FIELD_RENAMES: Record<MetricType, Record<string, string>> = {
@@ -621,189 +526,161 @@ function flattenAggregates(
   date: string,
   context: Record<string, unknown>,
   metric: MetricType,
-): Array<FlatRow & { date: string }> {
+): FlatRow[] {
   const renames = FIELD_RENAMES[metric];
   return aggregates.map((agg) => {
     const row: FlatRow = {};
     for (const [key, value] of Object.entries(agg)) {
-      const renamedKey = renames[key] ?? key;
-      row[renamedKey] = value as string | number | boolean | null;
+      row[renames[key] ?? key] = value as string | number | boolean | null;
     }
-    return { ...context, date, ...row } as FlatRow & { date: string };
+    return { ...context, date, ...row };
   });
 }
 
 // ---------------------------------------------------------------------------
-// Context Builders — Create denormalization context for each entity level
+// Export Results
 // ---------------------------------------------------------------------------
 
-function buildBrandContext(brand: Brand): Record<string, unknown> {
-  return { brandId: brand.id, brandName: brand.name };
-}
+const METRICS: MetricType[] = ["share-of-voice", "visibility", "citations"];
+const LEVELS: EntityLevel[] = ["brand", "topic", "prompt"];
 
-function buildTopicContext(
-  brand: Brand,
-  topic: Topic,
-): Record<string, unknown> {
-  return {
-    ...buildBrandContext(brand),
-    topicId: topic.id,
-    topicName: topic.name,
-  };
-}
+type MetricRows = Record<MetricType, FlatRow[]>;
+type ExportRows = Record<EntityLevel, MetricRows>;
 
-function buildPromptContext(
-  brand: Brand,
-  prompt: PromptWithTopic,
-): Record<string, unknown> {
-  return {
-    ...buildBrandContext(brand),
-    topicId: prompt.topicId,
-    topicName: prompt.topicName,
-    promptId: prompt.id,
-    promptQuery: prompt.query,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Data Collection — Orchestrate fetching and flattening for a single day
-// ---------------------------------------------------------------------------
-
-interface DailyCollectionTask {
+interface ExportError {
+  date: string;
   level: EntityLevel;
   metric: MetricType;
   entityId: string;
-  execute: () => Promise<void>;
+  error: string;
 }
 
-const METRICS: MetricType[] = ["share-of-voice", "visibility", "citations"];
-const METRIC_TO_BUCKET_KEY: Record<MetricType, keyof MetricBucket> = {
-  "share-of-voice": "shareOfVoice",
-  visibility: "visibility",
-  citations: "citations",
-};
-
-/**
- * Build all metric-fetch tasks for a single entity (brand, topic, or prompt).
- * Each task fetches one metric's aggregates for one day and appends flat rows.
- */
-function buildEntityMetricTasks(
-  client: OmniaApiClient,
-  level: EntityLevel,
-  entityId: string,
-  apiPath: string,
-  date: string,
-  context: Record<string, unknown>,
-  bucket: MetricBucket,
-): DailyCollectionTask[] {
-  return METRICS.map((metric) => ({
-    level,
-    metric,
-    entityId,
-    execute: async () => {
-      const aggs = await fetchAggregates<Record<string, unknown>>(
-        client,
-        apiPath,
-        metric,
-        date,
-      );
-      bucket[METRIC_TO_BUCKET_KEY[metric]].push(
-        ...flattenAggregates(aggs, date, context, metric),
-      );
-    },
-  }));
+function createEmptyMetricRows(): MetricRows {
+  return { "share-of-voice": [], visibility: [], citations: [] };
 }
 
-function buildDailyTasks(
-  client: OmniaApiClient,
-  entities: EntityContext,
-  date: string,
-  results: ExportResults,
-): DailyCollectionTask[] {
+function createExportRows(): ExportRows {
+  return {
+    brand: createEmptyMetricRows(),
+    topic: createEmptyMetricRows(),
+    prompt: createEmptyMetricRows(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Task Descriptors
+//
+// A flat list of { level, metric, entityId, apiPath, context } objects.
+// No closures, no execute methods. Just data describing what to fetch.
+// ---------------------------------------------------------------------------
+
+interface FetchTask {
+  level: EntityLevel;
+  metric: MetricType;
+  entityId: string;
+  apiPath: string;
+  context: Record<string, unknown>;
+}
+
+function buildDailyTasks(entities: EntityContext, date: string): FetchTask[] {
   const { brand, topics, prompts } = entities;
-  const tasks: DailyCollectionTask[] = [];
+  const tasks: FetchTask[] = [];
 
-  tasks.push(
-    ...buildEntityMetricTasks(
-      client,
-      "brand",
-      brand.id,
-      `/brands/${brand.id}`,
-      date,
-      buildBrandContext(brand),
-      results.brand,
-    ),
-  );
+  const brandCtx = { brandId: brand.id, brandName: brand.name };
+
+  for (const metric of METRICS) {
+    tasks.push({
+      level: "brand",
+      metric,
+      entityId: brand.id,
+      apiPath: `/brands/${brand.id}/${metric}/aggregates`,
+      context: brandCtx,
+    });
+  }
 
   for (const topic of topics) {
-    tasks.push(
-      ...buildEntityMetricTasks(
-        client,
-        "topic",
-        topic.id,
-        `/topics/${topic.id}`,
-        date,
-        buildTopicContext(brand, topic),
-        results.topic,
-      ),
-    );
+    const topicCtx = { ...brandCtx, topicId: topic.id, topicName: topic.name };
+    for (const metric of METRICS) {
+      tasks.push({
+        level: "topic",
+        metric,
+        entityId: topic.id,
+        apiPath: `/topics/${topic.id}/${metric}/aggregates`,
+        context: topicCtx,
+      });
+    }
   }
 
   for (const prompt of prompts) {
-    tasks.push(
-      ...buildEntityMetricTasks(
-        client,
-        "prompt",
-        prompt.id,
-        `/prompts/${prompt.id}`,
-        date,
-        buildPromptContext(brand, prompt),
-        results.prompt,
-      ),
-    );
+    const promptCtx = {
+      ...brandCtx,
+      topicId: prompt.topicId,
+      topicName: prompt.topicName,
+      promptId: prompt.id,
+      promptQuery: prompt.query,
+    };
+    for (const metric of METRICS) {
+      tasks.push({
+        level: "prompt",
+        metric,
+        entityId: prompt.id,
+        apiPath: `/prompts/${prompt.id}/${metric}/aggregates`,
+        context: promptCtx,
+      });
+    }
   }
 
   return tasks;
 }
 
 // ---------------------------------------------------------------------------
-// Accumulator — Collects rows across all days
+// Daily Aggregates
 // ---------------------------------------------------------------------------
 
-interface MetricBucket {
-  shareOfVoice: Array<FlatRow & { date: string }>;
-  visibility: Array<FlatRow & { date: string }>;
-  citations: Array<FlatRow & { date: string }>;
-}
+async function fetchAllDailyAggregates(
+  client: OmniaApiClient,
+  entities: EntityContext,
+  dates: string[],
+  concurrency: number,
+): Promise<{ rows: ExportRows; errors: ExportError[] }> {
+  const rows = createExportRows();
+  const errors: ExportError[] = [];
 
-interface ExportResults {
-  brand: MetricBucket;
-  topic: MetricBucket;
-  prompt: MetricBucket;
-  errors: Array<{
-    date: string;
-    level: EntityLevel;
-    metric: MetricType;
-    entityId: string;
-    error: string;
-  }>;
-}
+  console.log("Fetching daily aggregates...");
 
-function createExportResults(): ExportResults {
-  return {
-    brand: { shareOfVoice: [], visibility: [], citations: [] },
-    topic: { shareOfVoice: [], visibility: [], citations: [] },
-    prompt: { shareOfVoice: [], visibility: [], citations: [] },
-    errors: [],
-  };
-}
+  for (let i = 0; i < dates.length; i++) {
+    const date = dates[i];
+    console.log(`  [${i + 1}/${dates.length}] ${date}`);
 
-function getRowCounts(bucket: MetricBucket): MetricRowCounts {
-  return {
-    shareOfVoice: bucket.shareOfVoice.length,
-    visibility: bucket.visibility.length,
-    citations: bucket.citations.length,
-  };
+    const tasks = buildDailyTasks(entities, date);
+
+    await mapWithConcurrency(tasks, concurrency, async (task) => {
+      try {
+        const aggregates = await client.fetchAllPages<Record<string, unknown>>(
+          task.apiPath,
+          "aggregates",
+          { startDate: date, endDate: date },
+        );
+        const flatRows = flattenAggregates(
+          aggregates,
+          date,
+          task.context,
+          task.metric,
+        );
+        rows[task.level][task.metric].push(...flatRows);
+      } catch (error) {
+        errors.push({
+          date,
+          level: task.level,
+          metric: task.metric,
+          entityId: task.entityId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+
+  return { rows, errors };
 }
 
 // ---------------------------------------------------------------------------
@@ -811,31 +688,23 @@ function getRowCounts(bucket: MetricBucket): MetricRowCounts {
 // ---------------------------------------------------------------------------
 
 function writeExportFiles(
-  results: ExportResults,
-  manifest: ExportManifest,
+  rows: ExportRows,
+  manifest: Record<string, unknown>,
   outputDir: string,
 ): void {
-  const levels: EntityLevel[] = ["brand", "topic", "prompt"];
-
-  for (const level of levels) {
+  for (const level of LEVELS) {
     fs.mkdirSync(path.join(outputDir, level), { recursive: true });
   }
 
   writeJsonFile(path.join(outputDir, "manifest.json"), manifest);
 
-  for (const level of levels) {
-    writeJsonFile(
-      path.join(outputDir, level, "share-of-voice.json"),
-      results[level].shareOfVoice,
-    );
-    writeJsonFile(
-      path.join(outputDir, level, "visibility.json"),
-      results[level].visibility,
-    );
-    writeJsonFile(
-      path.join(outputDir, level, "citations.json"),
-      results[level].citations,
-    );
+  for (const level of LEVELS) {
+    for (const metric of METRICS) {
+      writeJsonFile(
+        path.join(outputDir, level, `${metric}.json`),
+        rows[level][metric],
+      );
+    }
   }
 }
 
@@ -846,7 +715,7 @@ function writeJsonFile(filePath: string, data: unknown): void {
 }
 
 // ---------------------------------------------------------------------------
-// Logging Helpers
+// Logging
 // ---------------------------------------------------------------------------
 
 function formatDuration(ms: number): string {
@@ -867,50 +736,50 @@ function logConfig(config: ExportConfig): void {
 }
 
 function logExportPlan(entities: EntityContext, days: number): void {
-  const entitiesCount = 1 + entities.topics.length + entities.prompts.length;
-  const tasksPerDay = entitiesCount * 3;
+  const entityCount = 1 + entities.topics.length + entities.prompts.length;
+  const tasksPerDay = entityCount * METRICS.length;
 
   console.log(`\nExport plan:`);
   console.log(
-    `  ${entitiesCount} entities (1 brand + ${entities.topics.length} topics + ${entities.prompts.length} prompts)`,
+    `  ${entityCount} entities (1 brand + ${entities.topics.length} topics + ${entities.prompts.length} prompts)`,
   );
   console.log(
-    `  ${days} days x ${tasksPerDay} tasks/day = ${days * tasksPerDay} total API task groups`,
+    `  ${days} days x ${tasksPerDay} tasks/day = ${days * tasksPerDay} total API calls`,
   );
-  console.log(`  (each task may require multiple pages)\n`);
+  console.log(`  (paginated endpoints may require additional requests)\n`);
 }
 
 function logSummary(
-  results: ExportResults,
-  manifest: ExportManifest,
+  rows: ExportRows,
+  errors: ExportError[],
+  totalApiCalls: number,
+  durationMs: number,
   outputDir: string,
 ): void {
-  const { stats } = manifest;
-
   console.log(`\n=== Export Complete ===\n`);
-  console.log(`Duration:   ${formatDuration(stats.durationMs)}`);
-  console.log(`API calls:  ${stats.totalApiCalls}`);
+  console.log(`Duration:   ${formatDuration(durationMs)}`);
+  console.log(`API calls:  ${totalApiCalls}`);
   console.log(`Rows exported:`);
 
-  const levels: EntityLevel[] = ["brand", "topic", "prompt"];
-  for (const level of levels) {
-    const counts = stats.rowCounts[level];
+  for (const level of LEVELS) {
     const label = level.charAt(0).toUpperCase() + level.slice(1);
+    const sov = rows[level]["share-of-voice"].length;
+    const vis = rows[level]["visibility"].length;
+    const cit = rows[level]["citations"].length;
     console.log(
-      `  ${label.padEnd(8)} SOV: ${counts.shareOfVoice}, Visibility: ${counts.visibility}, Citations: ${counts.citations}`,
+      `  ${label.padEnd(8)} SOV: ${sov}, Visibility: ${vis}, Citations: ${cit}`,
     );
   }
 
-  if (results.errors.length > 0) {
-    console.log(`\nErrors (${results.errors.length}):`);
-    const displayErrors = results.errors.slice(0, 10);
-    for (const err of displayErrors) {
+  if (errors.length > 0) {
+    console.log(`\nErrors (${errors.length}):`);
+    for (const err of errors.slice(0, 10)) {
       console.log(
         `  ${err.date} ${err.level}/${err.metric} [${err.entityId}]: ${err.error}`,
       );
     }
-    if (results.errors.length > 10) {
-      console.log(`  ... and ${results.errors.length - 10} more`);
+    if (errors.length > 10) {
+      console.log(`  ... and ${errors.length - 10} more`);
     }
   }
 
@@ -918,52 +787,16 @@ function logSummary(
 }
 
 // ---------------------------------------------------------------------------
-// Daily Aggregates — Fetch all metrics for all entities across all days
-// ---------------------------------------------------------------------------
-
-async function fetchAllDailyAggregates(
-  client: OmniaApiClient,
-  entities: EntityContext,
-  dates: string[],
-  results: ExportResults,
-  concurrency: number,
-): Promise<void> {
-  console.log("Fetching daily aggregates...");
-
-  for (let i = 0; i < dates.length; i++) {
-    const date = dates[i];
-    console.log(`  [${i + 1}/${dates.length}] ${date}`);
-
-    const tasks = buildDailyTasks(client, entities, date, results);
-
-    await mapWithConcurrency(tasks, concurrency, async (task) => {
-      try {
-        await task.execute();
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        results.errors.push({
-          date,
-          level: task.level,
-          metric: task.metric,
-          entityId: task.entityId,
-          error: message,
-        });
-      }
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Manifest Builder
+// Manifest
 // ---------------------------------------------------------------------------
 
 function buildManifest(
   config: ExportConfig,
   entities: EntityContext,
-  results: ExportResults,
+  rows: ExportRows,
   totalApiCalls: number,
   durationMs: number,
-): ExportManifest {
+): Record<string, unknown> {
   return {
     exportedAt: new Date().toISOString(),
     apiBaseUrl: config.apiBaseUrl,
@@ -982,11 +815,12 @@ function buildManifest(
     stats: {
       totalApiCalls,
       durationMs,
-      rowCounts: {
-        brand: getRowCounts(results.brand),
-        topic: getRowCounts(results.topic),
-        prompt: getRowCounts(results.prompt),
-      },
+      rowCounts: Object.fromEntries(
+        LEVELS.map((level) => [
+          level,
+          Object.fromEntries(METRICS.map((m) => [m, rows[level][m].length])),
+        ]),
+      ),
     },
   };
 }
@@ -1006,29 +840,33 @@ async function main(): Promise<void> {
 
   logExportPlan(entities, dates.length);
 
-  const results = createExportResults();
   const startTime = Date.now();
-
-  await fetchAllDailyAggregates(
+  const { rows, errors } = await fetchAllDailyAggregates(
     client,
     entities,
     dates,
-    results,
     config.concurrency,
   );
+  const durationMs = Date.now() - startTime;
 
   const manifest = buildManifest(
     config,
     entities,
-    results,
+    rows,
     client.getTotalApiCalls(),
-    Date.now() - startTime,
+    durationMs,
   );
 
   console.log("\nWriting output files...");
-  writeExportFiles(results, manifest, config.outputDir);
+  writeExportFiles(rows, manifest, config.outputDir);
 
-  logSummary(results, manifest, config.outputDir);
+  logSummary(
+    rows,
+    errors,
+    client.getTotalApiCalls(),
+    durationMs,
+    config.outputDir,
+  );
 }
 
 main().catch((error) => {
