@@ -134,7 +134,7 @@ The total number of API calls depends on how many topics and prompts your brand 
 - **91 entities** (1 brand + 15 topics + 75 prompts) x 3 metrics = 273 API calls per day
 - **31 days** = ~8,500 API calls total
 
-At the default concurrency of 4, this takes several minutes. Higher concurrency (e.g. `--concurrency 8`) reduces the time but consumes rate limit tokens faster. The script pauses automatically when tokens run low, so higher concurrency won't cause failures, but the gains plateau beyond 6-8 workers.
+At the default concurrency of 4, this takes several minutes. Higher concurrency (e.g. `--concurrency 8`) reduces the time but consumes rate limit tokens faster.
 
 If the API returns repeated 5xx errors, the script aborts after 5 consecutive failures. If this happens, wait a moment and retry with lower concurrency.
 
