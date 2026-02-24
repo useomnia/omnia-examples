@@ -674,7 +674,7 @@ async function fetchAllDailyAggregates(
           level: task.level,
           metric: task.metric,
           entityId: task.entityId,
-          error: error instanceof Error ? error.message : String(error),
+          error: String(error),
         });
       }
     });
@@ -870,9 +870,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  console.error(
-    "\nFatal error:",
-    error instanceof Error ? error.message : error,
-  );
+  console.error("\nFatal error:", String(error));
   process.exit(1);
 });
