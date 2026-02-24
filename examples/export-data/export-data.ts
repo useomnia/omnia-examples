@@ -11,7 +11,7 @@
  * external databases.
  *
  * Usage:
- *   OMNIA_API_KEY=ot_xxx npx tsx export-data.ts --brandId <uuid> [options]
+ *   OMNIA_API_KEY=ot_xxx tsx export-data.ts --brandId <uuid> [options]
  *
  * Documentation: https://docs.useomnia.com
  */
@@ -160,16 +160,13 @@ const DEFAULT_OUTPUT_DIR = "./export";
 
 const DEFAULT_CONCURRENCY = 4;
 const MAX_CONCURRENCY = 10;
-const RATE_LIMIT_SAFETY_THRESHOLD = 5;
 const MAX_PAGE_SIZE = 100;
 const MAX_RETRIES = 3;
 const MAX_CONSECUTIVE_ERRORS = 5;
 
-const INITIAL_RATE_LIMIT_TOKENS = 50;
 const BACKOFF_BASE_SECONDS = 2;
 const MAX_BACKOFF_SECONDS = 30;
 const DEFAULT_RETRY_AFTER_SECONDS = 5;
-const RATE_LIMIT_PAUSE_MS = 1000;
 
 // ---------------------------------------------------------------------------
 // CLI Parsing
@@ -260,7 +257,7 @@ Exports daily brand performance data from the Omnia public API.
 Produces flat, denormalized JSON files ready for BI tools.
 
 Usage:
-  OMNIA_API_KEY=ot_xxx npx tsx export-data.ts --brandId <uuid> [options]
+  OMNIA_API_KEY=ot_xxx tsx export-data.ts --brandId <uuid> [options]
 
 Required:
   --brandId <uuid>           Brand ID to export data for
@@ -296,11 +293,11 @@ Output:
 
 Examples:
   # Export today's data for a brand (auto-discovers topics and prompts)
-  OMNIA_API_KEY=ot_xxx npx tsx export-data.ts \\
+  OMNIA_API_KEY=ot_xxx tsx export-data.ts \\
     --brandId 123e4567-e89b-12d3-a456-426614174000
 
   # Export a specific date range with specific topics
-  OMNIA_API_KEY=ot_xxx npx tsx export-data.ts \\
+  OMNIA_API_KEY=ot_xxx tsx export-data.ts \\
     --brandId 123e4567-e89b-12d3-a456-426614174000 \\
     --topicIds abc123,def456 \\
     --startDate 2025-01-01 \\
@@ -377,7 +374,6 @@ function sleep(ms: number): Promise<void> {
 class OmniaApiClient {
   private readonly baseUrl: string;
   private readonly headers: Record<string, string>;
-  private remainingTokens = INITIAL_RATE_LIMIT_TOKENS;
   private totalApiCalls = 0;
   private consecutiveErrors = 0;
 
@@ -397,8 +393,7 @@ class OmniaApiClient {
     endpoint: string,
     params: Record<string, string> = {},
   ): Promise<T> {
-    const url = this.buildUrl(endpoint, params);
-    return this.request<T>(url);
+    return this.fetch<T>(this.buildUrl(endpoint, params));
   }
 
   async fetchAllPages<TItem>(
@@ -407,17 +402,15 @@ class OmniaApiClient {
     params: Record<string, string> = {},
   ): Promise<TItem[]> {
     type Page = PaginatedResponse<Record<string, TItem[]>>;
+    const allItems: TItem[] = [];
 
-    const firstPage = await this.get<Page>(endpoint, {
+    let nextUrl: string | undefined = this.buildUrl(endpoint, {
       ...params,
       pageSize: String(MAX_PAGE_SIZE),
     });
 
-    const allItems: TItem[] = [...(firstPage.data[dataKey] ?? [])];
-    let nextUrl = firstPage.links.next;
-
     while (nextUrl) {
-      const page = await this.request<Page>(nextUrl);
+      const page = await this.fetch<Page>(nextUrl);
       allItems.push(...(page.data[dataKey] ?? []));
       nextUrl = page.links.next;
     }
@@ -425,91 +418,88 @@ class OmniaApiClient {
     return allItems;
   }
 
-  private async request<T>(url: string, retryCount = 0): Promise<T> {
-    if (this.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-      throw new Error(
-        `Aborting: ${MAX_CONSECUTIVE_ERRORS} consecutive API errors. ` +
-          `The API may be overloaded. Try again later or reduce --concurrency.`,
-      );
-    }
+  // -- Core fetch with retry logic ----------------------------------------
 
-    await this.waitForRateLimit();
+  private async fetch<T>(url: string, retries = 0): Promise<T> {
+    this.checkCircuitBreaker();
 
-    const response = await fetch(url, { method: "GET", headers: this.headers });
-
-    this.trackRateLimitHeaders(response);
+    const response = await globalThis.fetch(url, {
+      method: "GET",
+      headers: this.headers,
+    });
     this.totalApiCalls++;
 
-    // 429: rate-limited. Wait and retry without counting it as an error.
     if (response.status === 429) {
-      const waitSeconds = this.getRetryAfterSeconds(response);
-      return this.retry<T>(url, retryCount, response.status, waitSeconds);
+      return this.retryAfter<T>(url, retries, response);
     }
 
-    // 5xx: server error. Count towards circuit breaker, then retry.
     if (response.status >= 500) {
       this.consecutiveErrors++;
-      const waitSeconds = Math.min(
-        BACKOFF_BASE_SECONDS ** retryCount,
-        MAX_BACKOFF_SECONDS,
-      );
-      return this.retry<T>(url, retryCount, response.status, waitSeconds);
+      return this.retryWithBackoff<T>(url, retries, response.status);
     }
 
     if (!response.ok) {
       this.consecutiveErrors++;
-      const description = await this.getErrorDescription(response);
-      throw new Error(`API ${response.status}: ${description} (${url})`);
+      await this.throwApiError(response, url);
     }
 
     this.consecutiveErrors = 0;
     return response.json() as Promise<T>;
   }
 
-  private async retry<T>(
+  // -- Retry strategies ---------------------------------------------------
+
+  private async retryAfter<T>(
     url: string,
-    retryCount: number,
-    status: number,
-    waitSeconds: number,
+    retries: number,
+    response: Response,
   ): Promise<T> {
-    if (retryCount >= MAX_RETRIES) {
+    if (retries >= MAX_RETRIES) {
+      throw new Error(`Rate limited after ${MAX_RETRIES} retries (${url})`);
+    }
+
+    const seconds = this.parseRetryAfterHeader(response);
+    console.warn(
+      `  429 on ${url}. Retry-After: ${seconds}s (attempt ${retries + 1}/${MAX_RETRIES})`,
+    );
+    await sleep(seconds * 1000);
+    return this.fetch<T>(url, retries + 1);
+  }
+
+  private async retryWithBackoff<T>(
+    url: string,
+    retries: number,
+    status: number,
+  ): Promise<T> {
+    if (retries >= MAX_RETRIES) {
       throw new Error(
         `Failed after ${MAX_RETRIES} retries: ${status} (${url})`,
       );
     }
-    console.warn(
-      `  ${status} on ${url}. Waiting ${waitSeconds}s ` +
-        `(attempt ${retryCount + 1}/${MAX_RETRIES})...`,
+
+    const seconds = Math.min(
+      BACKOFF_BASE_SECONDS ** retries,
+      MAX_BACKOFF_SECONDS,
     );
-    await sleep(waitSeconds * 1000);
-    return this.request<T>(url, retryCount + 1);
+    console.warn(
+      `  ${status} on ${url}. Backing off ${seconds}s (attempt ${retries + 1}/${MAX_RETRIES})`,
+    );
+    await sleep(seconds * 1000);
+    return this.fetch<T>(url, retries + 1);
   }
 
-  private async getErrorDescription(response: Response): Promise<string> {
-    try {
-      const body = (await response.json()) as ApiError;
-      return body.error.description;
-    } catch {
-      return response.statusText;
+  // -- Helpers ------------------------------------------------------------
+
+  private checkCircuitBreaker(): void {
+    if (this.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      throw new Error(
+        `Aborting: ${MAX_CONSECUTIVE_ERRORS} consecutive server errors. ` +
+          `Try again later or reduce --concurrency.`,
+      );
     }
   }
 
-  private buildUrl(endpoint: string, params: Record<string, string>): string {
-    const url = new URL(`${this.baseUrl}${endpoint}`);
-    for (const [key, value] of Object.entries(params)) {
-      url.searchParams.set(key, value);
-    }
-    return url.toString();
-  }
-
-  private trackRateLimitHeaders(response: Response): void {
-    const remaining = response.headers.get("X-RateLimit-Remaining");
-    if (remaining !== null) {
-      this.remainingTokens = parseInt(remaining, 10);
-    }
-  }
-
-  private getRetryAfterSeconds(response: Response): number {
+  private parseRetryAfterHeader(response: Response): number {
     const header = response.headers.get("Retry-After");
     if (header !== null) {
       const seconds = parseInt(header, 10);
@@ -518,10 +508,21 @@ class OmniaApiClient {
     return DEFAULT_RETRY_AFTER_SECONDS;
   }
 
-  private async waitForRateLimit(): Promise<void> {
-    if (this.remainingTokens < RATE_LIMIT_SAFETY_THRESHOLD) {
-      await sleep(RATE_LIMIT_PAUSE_MS);
+  private async throwApiError(response: Response, url: string): Promise<never> {
+    let description = response.statusText;
+    try {
+      const body = (await response.json()) as ApiError;
+      description = body.error.description;
+    } catch {}
+    throw new Error(`API ${response.status}: ${description} (${url})`);
+  }
+
+  private buildUrl(endpoint: string, params: Record<string, string>): string {
+    const url = new URL(`${this.baseUrl}${endpoint}`);
+    for (const [key, value] of Object.entries(params)) {
+      url.searchParams.set(key, value);
     }
+    return url.toString();
   }
 }
 

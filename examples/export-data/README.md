@@ -103,7 +103,7 @@ Every row is self-contained. Context fields are denormalized into each row so th
 
 1. **Discovery**: Fetches the brand, then auto-discovers all topics and prompts under it (unless filtered with `--topicIds` / `--promptIds`)
 2. **Daily aggregates**: For each day in the date range, fetches all 9 metric/level combinations for every entity. Uses concurrent workers (configurable with `--concurrency`) and handles pagination automatically.
-3. **Rate limiting**: Tracks the `X-RateLimit-Remaining` header and pauses when running low. Retries on 429 (rate limited) and 5xx (server error) with exponential backoff. Only 5xx errors count toward the circuit breaker, which aborts after 5 consecutive server failures.
+3. **Retries**: Retries on 429 (rate limited) using the `Retry-After` header, and on 5xx (server error) with exponential backoff. Only 5xx errors count toward the circuit breaker, which aborts after 5 consecutive server failures.
 4. **Output**: Writes denormalized JSON files organized by level (brand/topic/prompt).
 
 ## Examples
