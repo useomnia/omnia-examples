@@ -6,6 +6,10 @@
  * Exports daily brand performance data (share of voice, visibility, citations)
  * from the Omnia public API at brand, topic, and prompt granularity.
  *
+ * Designed as a reference implementation for integrating Omnia analytics data
+ * with BI tools (Looker Studio, BigQuery, Tableau, etc.) or ingesting into
+ * external databases.
+ *
  * Usage:
  *   OMNIA_API_KEY=ot_xxx tsx export-data.ts --brandId <uuid> [options]
  *
@@ -23,6 +27,14 @@ interface PaginatedResponse<T> {
   data: T;
   pagination: { page: number; pageSize: number; totalItems: number };
   links: { prev?: string; next?: string };
+}
+
+interface SingleResponse<T> {
+  data: T;
+}
+
+interface ApiError {
+  error: { code: number; description: string };
 }
 
 interface Brand {
@@ -58,12 +70,10 @@ interface ExportConfig {
   concurrency: number;
 }
 
-interface ExportError {
-  date: string;
-  level: EntityLevel;
-  metric: MetricType;
-  entityId: string;
-  error: string;
+interface EntityContext {
+  brand: Brand;
+  topics: Topic[];
+  prompts: Array<Prompt & { topicName: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -82,9 +92,6 @@ const MAX_CONSECUTIVE_ERRORS = 5;
 const BACKOFF_BASE_SECONDS = 2;
 const MAX_BACKOFF_SECONDS = 30;
 const DEFAULT_RETRY_AFTER_SECONDS = 5;
-
-const METRICS: MetricType[] = ["share-of-voice", "visibility", "citations"];
-const LEVELS: EntityLevel[] = ["brand", "topic", "prompt"];
 
 // ---------------------------------------------------------------------------
 // CLI Parsing
@@ -117,7 +124,7 @@ function parseCliArgs(): ExportConfig {
   const topicIdsRaw = getArgValue(args, "--topicIds");
   const promptIdsRaw = getArgValue(args, "--promptIds");
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = formatDateUTC(new Date());
   const startDate = getArgValue(args, "--startDate") ?? today;
   const endDate = getArgValue(args, "--endDate") ?? today;
 
@@ -226,8 +233,12 @@ Documentation: https://docs.useomnia.com
 }
 
 // ---------------------------------------------------------------------------
-// Date Utilities
+// Date Utilities (all UTC to avoid timezone drift)
 // ---------------------------------------------------------------------------
+
+function formatDateUTC(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
 
 function isValidDate(dateStr: string): boolean {
   return (
@@ -242,7 +253,7 @@ function generateDateRange(startDate: string, endDate: string): string[] {
   const end = new Date(endDate + "T00:00:00Z");
 
   while (current <= end) {
-    dates.push(current.toISOString().slice(0, 10));
+    dates.push(formatDateUTC(current));
     current.setUTCDate(current.getUTCDate() + 1);
   }
 
@@ -250,7 +261,7 @@ function generateDateRange(startDate: string, endDate: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Concurrency
+// Concurrency Utilities
 // ---------------------------------------------------------------------------
 
 async function mapWithConcurrency<T, R>(
@@ -261,7 +272,6 @@ async function mapWithConcurrency<T, R>(
   const results: R[] = new Array(items.length);
   let nextIndex = 0;
 
-  // Each worker pulls the next item from the queue until none remain
   async function worker(): Promise<void> {
     while (nextIndex < items.length) {
       const index = nextIndex++;
@@ -283,117 +293,221 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// API Client (module-level state, plain functions)
+// Omnia API Client
 // ---------------------------------------------------------------------------
 
-let apiBaseUrl = "";
-let apiHeaders: Record<string, string> = {};
-let totalApiCalls = 0;
-let consecutiveErrors = 0;
+class OmniaApiClient {
+  private readonly baseUrl: string;
+  private readonly headers: Record<string, string>;
+  private totalApiCalls = 0;
+  private consecutiveErrors = 0;
 
-function initClient(apiKey: string, baseUrl: string): void {
-  apiBaseUrl = baseUrl;
-  apiHeaders = { Authorization: `Bearer ${apiKey}` };
-}
-
-function buildUrl(
-  endpoint: string,
-  params: Record<string, string> = {},
-): string {
-  const url = new URL(`${apiBaseUrl}${endpoint}`);
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, value);
-  }
-  return url.toString();
-}
-
-async function apiFetch<T>(url: string, retries = 0): Promise<T> {
-  if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-    throw new Error(
-      `Aborting: ${MAX_CONSECUTIVE_ERRORS} consecutive server errors. ` +
-        `Try again later or reduce --concurrency.`,
-    );
+  constructor(apiKey: string, baseUrl: string) {
+    this.baseUrl = baseUrl;
+    this.headers = {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    };
   }
 
-  const response = await fetch(url, { headers: apiHeaders });
-  totalApiCalls++;
+  getTotalApiCalls(): number {
+    return this.totalApiCalls;
+  }
 
-  if (response.status === 429) {
+  async get<T>(
+    endpoint: string,
+    params: Record<string, string> = {},
+  ): Promise<T> {
+    return this.request<T>(this.buildUrl(endpoint, params));
+  }
+
+  async fetchAllPages<TItem>(
+    endpoint: string,
+    dataKey: string,
+    params: Record<string, string> = {},
+  ): Promise<TItem[]> {
+    type Page = PaginatedResponse<Record<string, TItem[]>>;
+    const allItems: TItem[] = [];
+
+    let nextUrl: string | undefined = this.buildUrl(endpoint, {
+      ...params,
+      pageSize: String(MAX_PAGE_SIZE),
+    });
+
+    while (nextUrl) {
+      const page = await this.request<Page>(nextUrl);
+      allItems.push(...(page.data[dataKey] ?? []));
+      nextUrl = page.links.next;
+    }
+
+    return allItems;
+  }
+
+  // -- Core fetch with retry logic ----------------------------------------
+
+  private async request<T>(url: string, retries = 0): Promise<T> {
+    this.checkCircuitBreaker();
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: this.headers,
+    });
+    this.totalApiCalls++;
+
+    if (response.status === 429) {
+      return this.retryAfter<T>(url, retries, response);
+    }
+
+    if (response.status >= 500) {
+      this.consecutiveErrors++;
+      return this.retryWithBackoff<T>(url, retries, response.status);
+    }
+
+    if (!response.ok) {
+      this.consecutiveErrors++;
+      await this.throwApiError(response, url);
+    }
+
+    this.consecutiveErrors = 0;
+    return response.json() as Promise<T>;
+  }
+
+  // -- Retry strategies ---------------------------------------------------
+
+  private async retryAfter<T>(
+    url: string,
+    retries: number,
+    response: Response,
+  ): Promise<T> {
     if (retries >= MAX_RETRIES) {
       throw new Error(`Rate limited after ${MAX_RETRIES} retries (${url})`);
     }
-    const header = response.headers.get("Retry-After");
-    const seconds =
-      header !== null && !isNaN(parseInt(header, 10))
-        ? parseInt(header, 10)
-        : DEFAULT_RETRY_AFTER_SECONDS;
+
+    const seconds = this.parseRetryAfterHeader(response);
     console.warn(
-      `  429 rate limited. Retry-After: ${seconds}s (attempt ${retries + 1}/${MAX_RETRIES})`,
+      `  429 on ${url}. Retry-After: ${seconds}s (attempt ${retries + 1}/${MAX_RETRIES})`,
     );
     await sleep(seconds * 1000);
-    return apiFetch<T>(url, retries + 1);
+    return this.request<T>(url, retries + 1);
   }
 
-  if (response.status >= 500) {
-    consecutiveErrors++;
+  private async retryWithBackoff<T>(
+    url: string,
+    retries: number,
+    status: number,
+  ): Promise<T> {
     if (retries >= MAX_RETRIES) {
       throw new Error(
-        `Failed after ${MAX_RETRIES} retries: ${response.status} (${url})`,
+        `Failed after ${MAX_RETRIES} retries: ${status} (${url})`,
       );
     }
+
     const seconds = Math.min(
       BACKOFF_BASE_SECONDS ** retries,
       MAX_BACKOFF_SECONDS,
     );
     console.warn(
-      `  ${response.status} server error. Backing off ${seconds}s (attempt ${retries + 1}/${MAX_RETRIES})`,
+      `  ${status} on ${url}. Backing off ${seconds}s (attempt ${retries + 1}/${MAX_RETRIES})`,
     );
     await sleep(seconds * 1000);
-    return apiFetch<T>(url, retries + 1);
+    return this.request<T>(url, retries + 1);
   }
 
-  if (!response.ok) {
+  // -- Helpers ------------------------------------------------------------
+
+  private checkCircuitBreaker(): void {
+    if (this.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      throw new Error(
+        `Aborting: ${MAX_CONSECUTIVE_ERRORS} consecutive server errors. ` +
+          `Try again later or reduce --concurrency.`,
+      );
+    }
+  }
+
+  private parseRetryAfterHeader(response: Response): number {
+    const header = response.headers.get("Retry-After");
+    if (header !== null) {
+      const seconds = parseInt(header, 10);
+      if (!isNaN(seconds)) return seconds;
+    }
+    return DEFAULT_RETRY_AFTER_SECONDS;
+  }
+
+  private async throwApiError(response: Response, url: string): Promise<never> {
     let description = response.statusText;
     try {
-      const body = await response.json();
+      const body = (await response.json()) as ApiError;
       description = body.error.description;
     } catch {}
     throw new Error(`API ${response.status}: ${description} (${url})`);
   }
 
-  consecutiveErrors = 0;
-  return response.json() as Promise<T>;
+  private buildUrl(endpoint: string, params: Record<string, string>): string {
+    const url = new URL(`${this.baseUrl}${endpoint}`);
+    for (const [key, value] of Object.entries(params)) {
+      url.searchParams.set(key, value);
+    }
+    return url.toString();
+  }
 }
 
-async function fetchAllPages<TItem>(
-  endpoint: string,
-  dataKey: string,
-  params: Record<string, string> = {},
-): Promise<TItem[]> {
-  type Page = PaginatedResponse<Record<string, TItem[]>>;
-  const allItems: TItem[] = [];
+// ---------------------------------------------------------------------------
+// Entity Discovery
+// ---------------------------------------------------------------------------
 
-  let nextUrl: string | undefined = buildUrl(endpoint, {
-    ...params,
-    pageSize: String(MAX_PAGE_SIZE),
-  });
+async function discoverEntities(
+  client: OmniaApiClient,
+  config: ExportConfig,
+): Promise<EntityContext> {
+  console.log("Fetching brand details...");
+  const { data: brand } = await client.get<SingleResponse<Brand>>(
+    `/brands/${config.brandId}`,
+  );
+  console.log(`  Brand: ${brand.name} (${brand.domain})`);
 
-  while (nextUrl) {
-    const page = await apiFetch<Page>(nextUrl);
-    allItems.push(...(page.data[dataKey] ?? []));
-    nextUrl = page.links.next;
-  }
+  console.log("Discovering topics...");
+  const allTopics = await client.fetchAllPages<Topic>(
+    `/brands/${config.brandId}/topics`,
+    "topics",
+  );
 
-  return allItems;
+  const topics = config.topicIds
+    ? allTopics.filter((t) => config.topicIds!.includes(t.id))
+    : allTopics;
+
+  console.log(`  Found ${topics.length} topics`);
+
+  console.log("Discovering prompts...");
+  const topicPromptPairs = await mapWithConcurrency(
+    topics,
+    config.concurrency,
+    async (topic) => {
+      const prompts = await client.fetchAllPages<Prompt>(
+        `/topics/${topic.id}/prompts`,
+        "prompts",
+      );
+      return prompts.map((p): Prompt & { topicName: string } => ({
+        ...p,
+        topicName: topic.name,
+      }));
+    },
+  );
+
+  const allPrompts = topicPromptPairs.flat();
+  const prompts = config.promptIds
+    ? allPrompts.filter((p) => config.promptIds!.includes(p.id))
+    : allPrompts;
+
+  console.log(`  Found ${prompts.length} prompts`);
+
+  return { brand, topics, prompts };
 }
 
 // ---------------------------------------------------------------------------
 // Row Flattening
 //
 // Rename API fields to avoid ambiguity (e.g. "brand" -> "mentionedBrand"
-// so it doesn't clash with the exported brand context fields).
-// Remaining fields pass through as-is since SOV and visibility have
-// different metric fields (shareOfVoice/mentionCount vs visibility).
+// so it doesn't clash with the exported brand). Fields not renamed pass through.
 // ---------------------------------------------------------------------------
 
 const FIELD_RENAMES: Record<MetricType, Record<string, string>> = {
@@ -407,188 +521,192 @@ const FIELD_RENAMES: Record<MetricType, Record<string, string>> = {
   },
 };
 
-function flatten(
-  metric: MetricType,
+function flattenAggregates(
   aggregates: Record<string, unknown>[],
   date: string,
   context: Record<string, unknown>,
+  metric: MetricType,
 ): FlatRow[] {
   const renames = FIELD_RENAMES[metric];
   return aggregates.map((agg) => {
-    const renamed: FlatRow = {};
+    const row: FlatRow = {};
     for (const [key, value] of Object.entries(agg)) {
-      renamed[renames[key] ?? key] = value as string | number | boolean | null;
+      row[renames[key] ?? key] = value as string | number | boolean | null;
     }
-    return { ...context, date, ...renamed };
+    return { ...context, date, ...row };
   });
 }
 
 // ---------------------------------------------------------------------------
-// Entity Discovery
+// Export Results
 // ---------------------------------------------------------------------------
 
-interface EntityContext {
-  brand: Brand;
-  topics: Topic[];
-  prompts: Array<Prompt & { topicName: string }>;
+const METRICS: MetricType[] = ["share-of-voice", "visibility", "citations"];
+const LEVELS: EntityLevel[] = ["brand", "topic", "prompt"];
+
+type MetricRows = Record<MetricType, FlatRow[]>;
+type ExportRows = Record<EntityLevel, MetricRows>;
+
+interface ExportError {
+  date: string;
+  level: EntityLevel;
+  metric: MetricType;
+  entityId: string;
+  error: string;
 }
 
-async function discoverEntities(config: ExportConfig): Promise<EntityContext> {
-  console.log("Fetching brand details...");
-  const { data: brand } = await apiFetch<{ data: Brand }>(
-    buildUrl(`/brands/${config.brandId}`),
-  );
-  console.log(`  Brand: ${brand.name} (${brand.domain})`);
+function createEmptyMetricRows(): MetricRows {
+  return { "share-of-voice": [], visibility: [], citations: [] };
+}
 
-  console.log("Discovering topics...");
-  const allTopics = await fetchAllPages<Topic>(
-    `/brands/${config.brandId}/topics`,
-    "topics",
-  );
-  const topics = config.topicIds
-    ? allTopics.filter((t) => config.topicIds!.includes(t.id))
-    : allTopics;
-  console.log(`  Found ${topics.length} topics`);
+function createExportRows(): ExportRows {
+  return {
+    brand: createEmptyMetricRows(),
+    topic: createEmptyMetricRows(),
+    prompt: createEmptyMetricRows(),
+  };
+}
 
-  console.log("Discovering prompts...");
-  const topicPromptPairs = await mapWithConcurrency(
-    topics,
-    config.concurrency,
-    async (topic) => {
-      const prompts = await fetchAllPages<Prompt>(
-        `/topics/${topic.id}/prompts`,
-        "prompts",
-      );
-      return prompts.map((p) => ({ ...p, topicName: topic.name }));
-    },
-  );
-  const allPrompts = topicPromptPairs.flat();
-  const prompts = config.promptIds
-    ? allPrompts.filter((p) => config.promptIds!.includes(p.id))
-    : allPrompts;
-  console.log(`  Found ${prompts.length} prompts`);
+// ---------------------------------------------------------------------------
+// Task Descriptors
+//
+// A flat list of { level, metric, entityId, apiPath, context } objects.
+// No closures, no execute methods. Just data describing what to fetch.
+// ---------------------------------------------------------------------------
 
-  return { brand, topics, prompts };
+interface FetchTask {
+  level: EntityLevel;
+  metric: MetricType;
+  entityId: string;
+  apiPath: string;
+  context: Record<string, unknown>;
+}
+
+function buildDailyTasks(entities: EntityContext, date: string): FetchTask[] {
+  const { brand, topics, prompts } = entities;
+  const tasks: FetchTask[] = [];
+
+  const brandCtx = { brandId: brand.id, brandName: brand.name };
+
+  for (const metric of METRICS) {
+    tasks.push({
+      level: "brand",
+      metric,
+      entityId: brand.id,
+      apiPath: `/brands/${brand.id}/${metric}/aggregates`,
+      context: brandCtx,
+    });
+  }
+
+  for (const topic of topics) {
+    const topicCtx = { ...brandCtx, topicId: topic.id, topicName: topic.name };
+    for (const metric of METRICS) {
+      tasks.push({
+        level: "topic",
+        metric,
+        entityId: topic.id,
+        apiPath: `/topics/${topic.id}/${metric}/aggregates`,
+        context: topicCtx,
+      });
+    }
+  }
+
+  for (const prompt of prompts) {
+    const promptCtx = {
+      ...brandCtx,
+      topicId: prompt.topicId,
+      topicName: prompt.topicName,
+      promptId: prompt.id,
+      promptQuery: prompt.query,
+    };
+    for (const metric of METRICS) {
+      tasks.push({
+        level: "prompt",
+        metric,
+        entityId: prompt.id,
+        apiPath: `/prompts/${prompt.id}/${metric}/aggregates`,
+        context: promptCtx,
+      });
+    }
+  }
+
+  return tasks;
 }
 
 // ---------------------------------------------------------------------------
 // Daily Aggregates
 // ---------------------------------------------------------------------------
 
-type Results = Record<EntityLevel, Record<MetricType, FlatRow[]>>;
-
-async function fetchMetric(
-  metric: MetricType,
-  endpoint: string,
-  date: string,
-  context: Record<string, unknown>,
-): Promise<FlatRow[]> {
-  const aggregates = await fetchAllPages<Record<string, unknown>>(
-    endpoint,
-    "aggregates",
-    { startDate: date, endDate: date },
-  );
-  return flatten(metric, aggregates, date, context);
-}
-
 async function fetchAllDailyAggregates(
+  client: OmniaApiClient,
   entities: EntityContext,
   dates: string[],
   concurrency: number,
-): Promise<{ results: Results; errors: ExportError[] }> {
-  const results: Results = {
-    brand: { "share-of-voice": [], visibility: [], citations: [] },
-    topic: { "share-of-voice": [], visibility: [], citations: [] },
-    prompt: { "share-of-voice": [], visibility: [], citations: [] },
-  };
+): Promise<{ rows: ExportRows; errors: ExportError[] }> {
+  const rows = createExportRows();
   const errors: ExportError[] = [];
-  const { brand, topics, prompts } = entities;
-  const brandCtx = { brandId: brand.id, brandName: brand.name };
 
-  console.log("\nFetching daily aggregates...");
+  console.log("Fetching daily aggregates...");
 
   for (let i = 0; i < dates.length; i++) {
     const date = dates[i];
     console.log(`  [${i + 1}/${dates.length}] ${date}`);
 
-    // Build a flat list of work items for this day
-    const work: Array<{
-      level: EntityLevel;
-      metric: MetricType;
-      entityId: string;
-      endpoint: string;
-      context: Record<string, unknown>;
-    }> = [];
+    const tasks = buildDailyTasks(entities, date);
 
-    for (const metric of METRICS) {
-      work.push({
-        level: "brand",
-        metric,
-        entityId: brand.id,
-        endpoint: `/brands/${brand.id}/${metric}/aggregates`,
-        context: brandCtx,
-      });
-    }
-
-    for (const topic of topics) {
-      const ctx = { ...brandCtx, topicId: topic.id, topicName: topic.name };
-      for (const metric of METRICS) {
-        work.push({
-          level: "topic",
-          metric,
-          entityId: topic.id,
-          endpoint: `/topics/${topic.id}/${metric}/aggregates`,
-          context: ctx,
-        });
-      }
-    }
-
-    for (const prompt of prompts) {
-      const ctx = {
-        ...brandCtx,
-        topicId: prompt.topicId,
-        topicName: prompt.topicName,
-        promptId: prompt.id,
-        promptQuery: prompt.query,
-      };
-      for (const metric of METRICS) {
-        work.push({
-          level: "prompt",
-          metric,
-          entityId: prompt.id,
-          endpoint: `/prompts/${prompt.id}/${metric}/aggregates`,
-          context: ctx,
-        });
-      }
-    }
-
-    await mapWithConcurrency(work, concurrency, async (item) => {
+    await mapWithConcurrency(tasks, concurrency, async (task) => {
       try {
-        const rows = await fetchMetric(
-          item.metric,
-          item.endpoint,
-          date,
-          item.context,
+        const aggregates = await client.fetchAllPages<Record<string, unknown>>(
+          task.apiPath,
+          "aggregates",
+          { startDate: date, endDate: date },
         );
-        results[item.level][item.metric].push(...rows);
+        const flatRows = flattenAggregates(
+          aggregates,
+          date,
+          task.context,
+          task.metric,
+        );
+        rows[task.level][task.metric].push(...flatRows);
       } catch (error) {
         errors.push({
           date,
-          level: item.level,
-          metric: item.metric,
-          entityId: item.entityId,
+          level: task.level,
+          metric: task.metric,
+          entityId: task.entityId,
           error: String(error),
         });
       }
     });
   }
 
-  return { results, errors };
+  return { rows, errors };
 }
 
 // ---------------------------------------------------------------------------
 // File Output
 // ---------------------------------------------------------------------------
+
+function writeExportFiles(
+  rows: ExportRows,
+  manifest: Record<string, unknown>,
+  outputDir: string,
+): void {
+  for (const level of LEVELS) {
+    fs.mkdirSync(path.join(outputDir, level), { recursive: true });
+  }
+
+  writeJsonFile(path.join(outputDir, "manifest.json"), manifest);
+
+  for (const level of LEVELS) {
+    for (const metric of METRICS) {
+      writeJsonFile(
+        path.join(outputDir, level, `${metric}.json`),
+        rows[level][metric],
+      );
+    }
+  }
+}
 
 function writeJsonFile(filePath: string, data: unknown): void {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
@@ -597,49 +715,89 @@ function writeJsonFile(filePath: string, data: unknown): void {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Logging
 // ---------------------------------------------------------------------------
 
-async function main(): Promise<void> {
-  const config = parseCliArgs();
-  initClient(config.apiKey, config.apiBaseUrl);
+function formatDuration(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${minutes}m ${secs}s`;
+}
 
+function logConfig(config: ExportConfig): void {
   console.log("\n=== Omnia Data Export ===\n");
   console.log(`API:        ${config.apiBaseUrl}`);
   console.log(`Brand ID:   ${config.brandId}`);
   console.log(`Date range: ${config.startDate} to ${config.endDate}`);
   console.log(`Output:     ${config.outputDir}`);
   console.log(`Concurrency: ${config.concurrency}\n`);
+}
 
-  const entities = await discoverEntities(config);
-  const dates = generateDateRange(config.startDate, config.endDate);
-
+function logExportPlan(entities: EntityContext, days: number): void {
   const entityCount = 1 + entities.topics.length + entities.prompts.length;
   const tasksPerDay = entityCount * METRICS.length;
+
   console.log(`\nExport plan:`);
   console.log(
     `  ${entityCount} entities (1 brand + ${entities.topics.length} topics + ${entities.prompts.length} prompts)`,
   );
   console.log(
-    `  ${dates.length} days x ${tasksPerDay} tasks/day = ${dates.length * tasksPerDay} total API calls`,
+    `  ${days} days x ${tasksPerDay} tasks/day = ${days * tasksPerDay} total API calls`,
   );
-  console.log(`  (paginated endpoints may require additional requests)`);
+  console.log(`  (paginated endpoints may require additional requests)\n`);
+}
 
-  const startTime = Date.now();
-  const { results, errors } = await fetchAllDailyAggregates(
-    entities,
-    dates,
-    config.concurrency,
-  );
-  const durationMs = Date.now() - startTime;
+function logSummary(
+  rows: ExportRows,
+  errors: ExportError[],
+  totalApiCalls: number,
+  durationMs: number,
+  outputDir: string,
+): void {
+  console.log(`\n=== Export Complete ===\n`);
+  console.log(`Duration:   ${formatDuration(durationMs)}`);
+  console.log(`API calls:  ${totalApiCalls}`);
+  console.log(`Rows exported:`);
 
-  // Write output files
-  console.log("\nWriting output files...");
   for (const level of LEVELS) {
-    fs.mkdirSync(path.join(config.outputDir, level), { recursive: true });
+    const label = level.charAt(0).toUpperCase() + level.slice(1);
+    const sov = rows[level]["share-of-voice"].length;
+    const vis = rows[level]["visibility"].length;
+    const cit = rows[level]["citations"].length;
+    console.log(
+      `  ${label.padEnd(8)} SOV: ${sov}, Visibility: ${vis}, Citations: ${cit}`,
+    );
   }
 
-  const manifest = {
+  if (errors.length > 0) {
+    console.log(`\nErrors (${errors.length}):`);
+    for (const err of errors.slice(0, 10)) {
+      console.log(
+        `  ${err.date} ${err.level}/${err.metric} [${err.entityId}]: ${err.error}`,
+      );
+    }
+    if (errors.length > 10) {
+      console.log(`  ... and ${errors.length - 10} more`);
+    }
+  }
+
+  console.log(`\nOutput: ${path.resolve(outputDir)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Manifest
+// ---------------------------------------------------------------------------
+
+function buildManifest(
+  config: ExportConfig,
+  entities: EntityContext,
+  rows: ExportRows,
+  totalApiCalls: number,
+  durationMs: number,
+): Record<string, unknown> {
+  return {
     exportedAt: new Date().toISOString(),
     apiBaseUrl: config.apiBaseUrl,
     dateRange: { startDate: config.startDate, endDate: config.endDate },
@@ -660,56 +818,55 @@ async function main(): Promise<void> {
       rowCounts: Object.fromEntries(
         LEVELS.map((level) => [
           level,
-          Object.fromEntries(METRICS.map((m) => [m, results[level][m].length])),
+          Object.fromEntries(METRICS.map((m) => [m, rows[level][m].length])),
         ]),
       ),
     },
   };
+}
 
-  writeJsonFile(path.join(config.outputDir, "manifest.json"), manifest);
-  for (const level of LEVELS) {
-    for (const metric of METRICS) {
-      writeJsonFile(
-        path.join(config.outputDir, level, `${metric}.json`),
-        results[level][metric],
-      );
-    }
-  }
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
-  // Summary
-  const seconds = Math.round(durationMs / 1000);
-  const duration =
-    seconds < 60
-      ? `${seconds}s`
-      : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+async function main(): Promise<void> {
+  const config = parseCliArgs();
+  const client = new OmniaApiClient(config.apiKey, config.apiBaseUrl);
 
-  console.log(`\n=== Export Complete ===\n`);
-  console.log(`Duration:   ${duration}`);
-  console.log(`API calls:  ${totalApiCalls}`);
-  console.log(`Rows exported:`);
-  for (const level of LEVELS) {
-    const label = (level.charAt(0).toUpperCase() + level.slice(1)).padEnd(8);
-    const sov = results[level]["share-of-voice"].length;
-    const vis = results[level]["visibility"].length;
-    const cit = results[level]["citations"].length;
-    console.log(
-      `  ${label} SOV: ${sov}, Visibility: ${vis}, Citations: ${cit}`,
-    );
-  }
+  logConfig(config);
 
-  if (errors.length > 0) {
-    console.log(`\nErrors (${errors.length}):`);
-    for (const err of errors.slice(0, 10)) {
-      console.log(
-        `  ${err.date} ${err.level}/${err.metric} [${err.entityId}]: ${err.error}`,
-      );
-    }
-    if (errors.length > 10) {
-      console.log(`  ... and ${errors.length - 10} more`);
-    }
-  }
+  const entities = await discoverEntities(client, config);
+  const dates = generateDateRange(config.startDate, config.endDate);
 
-  console.log(`\nOutput: ${path.resolve(config.outputDir)}`);
+  logExportPlan(entities, dates.length);
+
+  const startTime = Date.now();
+  const { rows, errors } = await fetchAllDailyAggregates(
+    client,
+    entities,
+    dates,
+    config.concurrency,
+  );
+  const durationMs = Date.now() - startTime;
+
+  const manifest = buildManifest(
+    config,
+    entities,
+    rows,
+    client.getTotalApiCalls(),
+    durationMs,
+  );
+
+  console.log("\nWriting output files...");
+  writeExportFiles(rows, manifest, config.outputDir);
+
+  logSummary(
+    rows,
+    errors,
+    client.getTotalApiCalls(),
+    durationMs,
+    config.outputDir,
+  );
 }
 
 main().catch((error) => {
