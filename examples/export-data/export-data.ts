@@ -442,49 +442,56 @@ class OmniaApiClient {
 
     // 429: rate-limited. Wait and retry without counting it as an error.
     if (response.status === 429) {
-      if (retryCount >= MAX_RETRIES) {
-        throw new Error(
-          `Failed after ${MAX_RETRIES} retries: ${response.status} (${url})`,
-        );
-      }
-      const waitSeconds = this.parseRetryAfter(response);
-      console.warn(
-        `  429 on ${url}. Waiting ${waitSeconds}s ` +
-          `(attempt ${retryCount + 1}/${MAX_RETRIES})...`,
-      );
-      await sleep(waitSeconds * 1000);
-      return this.request<T>(url, retryCount + 1);
+      const waitSeconds = this.getRetryAfterSeconds(response);
+      return this.retry<T>(url, retryCount, response.status, waitSeconds);
     }
 
     // 5xx: server error. Count towards circuit breaker, then retry.
     if (response.status >= 500) {
       this.consecutiveErrors++;
-      if (retryCount >= MAX_RETRIES) {
-        throw new Error(
-          `Failed after ${MAX_RETRIES} retries: ${response.status} (${url})`,
-        );
-      }
       const waitSeconds = Math.min(
         BACKOFF_BASE_SECONDS ** retryCount,
         MAX_BACKOFF_SECONDS,
       );
-      console.warn(
-        `  ${response.status} on ${url}. Waiting ${waitSeconds}s ` +
-          `(attempt ${retryCount + 1}/${MAX_RETRIES})...`,
-      );
-      await sleep(waitSeconds * 1000);
-      return this.request<T>(url, retryCount + 1);
+      return this.retry<T>(url, retryCount, response.status, waitSeconds);
     }
 
     if (!response.ok) {
       this.consecutiveErrors++;
-      const body = (await response.json().catch(() => null)) as ApiError | null;
-      const description = body?.error?.description ?? response.statusText;
+      const description = await this.getErrorDescription(response);
       throw new Error(`API ${response.status}: ${description} (${url})`);
     }
 
     this.consecutiveErrors = 0;
     return response.json() as Promise<T>;
+  }
+
+  private async retry<T>(
+    url: string,
+    retryCount: number,
+    status: number,
+    waitSeconds: number,
+  ): Promise<T> {
+    if (retryCount >= MAX_RETRIES) {
+      throw new Error(
+        `Failed after ${MAX_RETRIES} retries: ${status} (${url})`,
+      );
+    }
+    console.warn(
+      `  ${status} on ${url}. Waiting ${waitSeconds}s ` +
+        `(attempt ${retryCount + 1}/${MAX_RETRIES})...`,
+    );
+    await sleep(waitSeconds * 1000);
+    return this.request<T>(url, retryCount + 1);
+  }
+
+  private async getErrorDescription(response: Response): Promise<string> {
+    try {
+      const body = (await response.json()) as ApiError;
+      return body.error.description;
+    } catch {
+      return response.statusText;
+    }
   }
 
   private buildUrl(endpoint: string, params: Record<string, string>): string {
@@ -502,10 +509,10 @@ class OmniaApiClient {
     }
   }
 
-  private parseRetryAfter(response: Response): number {
-    const retryAfter = response.headers.get("Retry-After");
-    if (retryAfter !== null) {
-      const seconds = parseInt(retryAfter, 10);
+  private getRetryAfterSeconds(response: Response): number {
+    const header = response.headers.get("Retry-After");
+    if (header !== null) {
+      const seconds = parseInt(header, 10);
       if (!isNaN(seconds)) return seconds;
     }
     return DEFAULT_RETRY_AFTER_SECONDS;
