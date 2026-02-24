@@ -73,7 +73,7 @@ interface ExportConfig {
 interface EntityContext {
   brand: Brand;
   topics: Topic[];
-  prompts: Array<Prompt & { topicName: string }>;
+  prompts: Prompt[];
 }
 
 // ---------------------------------------------------------------------------
@@ -478,22 +478,14 @@ async function discoverEntities(
   console.log(`  Found ${topics.length} topics`);
 
   console.log("Discovering prompts...");
-  const topicPromptPairs = await mapWithConcurrency(
+  const promptsByTopic = await mapWithConcurrency(
     topics,
     config.concurrency,
-    async (topic) => {
-      const prompts = await client.fetchAllPages<Prompt>(
-        `/topics/${topic.id}/prompts`,
-        "prompts",
-      );
-      return prompts.map((p): Prompt & { topicName: string } => ({
-        ...p,
-        topicName: topic.name,
-      }));
-    },
+    (topic) =>
+      client.fetchAllPages<Prompt>(`/topics/${topic.id}/prompts`, "prompts"),
   );
 
-  const allPrompts = topicPromptPairs.flat();
+  const allPrompts = promptsByTopic.flat();
   const prompts = config.promptIds
     ? allPrompts.filter((p) => config.promptIds!.includes(p.id))
     : allPrompts;
@@ -582,9 +574,10 @@ interface FetchTask {
   context: Record<string, unknown>;
 }
 
-function buildDailyTasks(entities: EntityContext, date: string): FetchTask[] {
+function buildDailyTasks(entities: EntityContext): FetchTask[] {
   const { brand, topics, prompts } = entities;
   const tasks: FetchTask[] = [];
+  const topicName = new Map(topics.map((t) => [t.id, t.name]));
 
   const brandCtx = { brandId: brand.id, brandName: brand.name };
 
@@ -615,7 +608,7 @@ function buildDailyTasks(entities: EntityContext, date: string): FetchTask[] {
     const promptCtx = {
       ...brandCtx,
       topicId: prompt.topicId,
-      topicName: prompt.topicName,
+      topicName: topicName.get(prompt.topicId) ?? "",
       promptId: prompt.id,
       promptQuery: prompt.query,
     };
@@ -652,7 +645,7 @@ async function fetchAllDailyAggregates(
     const date = dates[i];
     console.log(`  [${i + 1}/${dates.length}] ${date}`);
 
-    const tasks = buildDailyTasks(entities, date);
+    const tasks = buildDailyTasks(entities);
 
     await mapWithConcurrency(tasks, concurrency, async (task) => {
       try {
