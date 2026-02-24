@@ -29,9 +29,15 @@ interface ApiPagination {
   totalItems: number;
 }
 
+interface PaginationLinks {
+  prev?: string;
+  next?: string;
+}
+
 interface PaginatedResponse<T> {
   data: T;
   pagination: ApiPagination;
+  links: PaginationLinks;
 }
 
 interface SingleResponse<T> {
@@ -390,8 +396,36 @@ class OmniaApiClient {
   async get<T>(
     endpoint: string,
     params: Record<string, string> = {},
-    retryCount = 0,
   ): Promise<T> {
+    const url = this.buildUrl(endpoint, params);
+    return this.request<T>(url);
+  }
+
+  async fetchAllPages<TItem>(
+    endpoint: string,
+    dataKey: string,
+    params: Record<string, string> = {},
+  ): Promise<TItem[]> {
+    type Page = PaginatedResponse<Record<string, TItem[]>>;
+
+    const firstPage = await this.get<Page>(endpoint, {
+      ...params,
+      pageSize: String(MAX_PAGE_SIZE),
+    });
+
+    const allItems: TItem[] = [...(firstPage.data[dataKey] ?? [])];
+    let nextUrl = firstPage.links.next;
+
+    while (nextUrl) {
+      const page = await this.request<Page>(nextUrl);
+      allItems.push(...(page.data[dataKey] ?? []));
+      nextUrl = page.links.next;
+    }
+
+    return allItems;
+  }
+
+  private async request<T>(url: string, retryCount = 0): Promise<T> {
     if (this.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
       throw new Error(
         `Aborting: ${MAX_CONSECUTIVE_ERRORS} consecutive API errors. ` +
@@ -401,7 +435,6 @@ class OmniaApiClient {
 
     await this.waitForRateLimit();
 
-    const url = this.buildUrl(endpoint, params);
     const response = await fetch(url, { method: "GET", headers: this.headers });
 
     this.trackRateLimitHeaders(response);
@@ -411,16 +444,16 @@ class OmniaApiClient {
     if (response.status === 429) {
       if (retryCount >= MAX_RETRIES) {
         throw new Error(
-          `Failed after ${MAX_RETRIES} retries: ${response.status} (${endpoint})`,
+          `Failed after ${MAX_RETRIES} retries: ${response.status} (${url})`,
         );
       }
       const waitSeconds = this.parseRetryAfter(response);
       console.warn(
-        `  429 on ${endpoint}. Waiting ${waitSeconds}s ` +
+        `  429 on ${url}. Waiting ${waitSeconds}s ` +
           `(attempt ${retryCount + 1}/${MAX_RETRIES})...`,
       );
       await sleep(waitSeconds * 1000);
-      return this.get<T>(endpoint, params, retryCount + 1);
+      return this.request<T>(url, retryCount + 1);
     }
 
     // 5xx: server error. Count towards circuit breaker, then retry.
@@ -428,7 +461,7 @@ class OmniaApiClient {
       this.consecutiveErrors++;
       if (retryCount >= MAX_RETRIES) {
         throw new Error(
-          `Failed after ${MAX_RETRIES} retries: ${response.status} (${endpoint})`,
+          `Failed after ${MAX_RETRIES} retries: ${response.status} (${url})`,
         );
       }
       const waitSeconds = Math.min(
@@ -436,55 +469,22 @@ class OmniaApiClient {
         MAX_BACKOFF_SECONDS,
       );
       console.warn(
-        `  ${response.status} on ${endpoint}. Waiting ${waitSeconds}s ` +
+        `  ${response.status} on ${url}. Waiting ${waitSeconds}s ` +
           `(attempt ${retryCount + 1}/${MAX_RETRIES})...`,
       );
       await sleep(waitSeconds * 1000);
-      return this.get<T>(endpoint, params, retryCount + 1);
+      return this.request<T>(url, retryCount + 1);
     }
 
     if (!response.ok) {
       this.consecutiveErrors++;
       const body = (await response.json().catch(() => null)) as ApiError | null;
       const description = body?.error?.description ?? response.statusText;
-      throw new Error(`API ${response.status}: ${description} (${endpoint})`);
+      throw new Error(`API ${response.status}: ${description} (${url})`);
     }
 
     this.consecutiveErrors = 0;
     return response.json() as Promise<T>;
-  }
-
-  async fetchAllPages<TItem>(
-    endpoint: string,
-    dataKey: string,
-    params: Record<string, string> = {},
-  ): Promise<TItem[]> {
-    const firstPage = await this.get<
-      PaginatedResponse<Record<string, TItem[]>>
-    >(endpoint, {
-      ...params,
-      page: "1",
-      pageSize: String(MAX_PAGE_SIZE),
-    });
-
-    const allItems: TItem[] = [...(firstPage.data[dataKey] ?? [])];
-    const { totalItems, pageSize } = firstPage.pagination;
-    const totalPages = Math.ceil(totalItems / pageSize);
-
-    for (let page = 2; page <= totalPages; page++) {
-      const response = await this.get<
-        PaginatedResponse<Record<string, TItem[]>>
-      >(endpoint, {
-        ...params,
-        page: String(page),
-        pageSize: String(MAX_PAGE_SIZE),
-      });
-
-      const items = response.data[dataKey] ?? [];
-      allItems.push(...items);
-    }
-
-    return allItems;
   }
 
   private buildUrl(endpoint: string, params: Record<string, string>): string {
