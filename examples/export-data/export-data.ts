@@ -79,7 +79,7 @@ interface Prompt {
 // Types — Flat Export Rows (Denormalized for BI)
 //
 // Each level extends the previous with additional context columns.
-// This ensures every row is self-contained for BI tools — no joins needed.
+// This ensures every row is self-contained for BI tools. No joins needed.
 // ---------------------------------------------------------------------------
 
 type FlatRow = Record<string, string | number | boolean | null>;
@@ -151,13 +151,19 @@ type EntityLevel = "brand" | "topic" | "prompt";
 
 const DEFAULT_API_BASE_URL = "https://app.useomnia.com/api/v1";
 const DEFAULT_OUTPUT_DIR = "./export";
-const DEFAULT_DAYS_BACK = 30;
 
 const DEFAULT_CONCURRENCY = 4;
+const MAX_CONCURRENCY = 10;
 const RATE_LIMIT_SAFETY_THRESHOLD = 5;
 const MAX_PAGE_SIZE = 100;
 const MAX_RETRIES = 3;
 const MAX_CONSECUTIVE_ERRORS = 5;
+
+const INITIAL_RATE_LIMIT_TOKENS = 50;
+const BACKOFF_BASE_SECONDS = 2;
+const MAX_BACKOFF_SECONDS = 30;
+const DEFAULT_RETRY_AFTER_SECONDS = 5;
+const RATE_LIMIT_PAUSE_MS = 1000;
 
 // ---------------------------------------------------------------------------
 // CLI Parsing
@@ -190,11 +196,9 @@ function parseCliArgs(): ExportConfig {
   const topicIdsRaw = getArgValue(args, "--topicIds");
   const promptIdsRaw = getArgValue(args, "--promptIds");
 
-  const endDate =
-    getArgValue(args, "--endDate") ?? formatDateUTC(daysAgoUTC(1));
-  const startDate =
-    getArgValue(args, "--startDate") ??
-    formatDateUTC(daysAgoUTC(DEFAULT_DAYS_BACK));
+  const today = formatDateUTC(new Date());
+  const startDate = getArgValue(args, "--startDate") ?? today;
+  const endDate = getArgValue(args, "--endDate") ?? today;
 
   if (!isValidDate(startDate) || !isValidDate(endDate)) {
     console.error("Error: dates must be in YYYY-MM-DD format.");
@@ -232,8 +236,10 @@ function getArgValue(args: string[], flag: string): string | undefined {
 function parseConcurrency(value: string | undefined): number {
   if (!value) return DEFAULT_CONCURRENCY;
   const n = parseInt(value, 10);
-  if (isNaN(n) || n < 1 || n > 20) {
-    console.error("Error: --concurrency must be between 1 and 20.");
+  if (isNaN(n) || n < 1 || n > MAX_CONCURRENCY) {
+    console.error(
+      `Error: --concurrency must be between 1 and ${MAX_CONCURRENCY}.`,
+    );
     process.exit(1);
   }
   return n;
@@ -256,10 +262,10 @@ Required:
 Optional:
   --topicIds <id,id,...>     Comma-separated topic IDs (default: auto-discover all)
   --promptIds <id,id,...>    Comma-separated prompt IDs (default: auto-discover all)
-  --startDate <YYYY-MM-DD>  Start of date range (default: 30 days ago)
-  --endDate <YYYY-MM-DD>    End of date range (default: yesterday)
+  --startDate <YYYY-MM-DD>  Start of date range (default: today)
+  --endDate <YYYY-MM-DD>    End of date range (default: today)
   --outputDir <path>         Output directory (default: ./export)
-  --concurrency <number>     Parallel requests (1-20, default: 4)
+  --concurrency <number>     Parallel requests (1-${MAX_CONCURRENCY}, default: ${DEFAULT_CONCURRENCY})
   --help, -h                 Show this help message
 
 Environment:
@@ -283,12 +289,12 @@ Output:
       └── citations.json
 
 Examples:
-  # Export last 30 days for a brand (auto-discovers topics and prompts)
-  OMNIA_API_KEY=ot_xxx npx tsx scripts/api/export-data.ts \\
+  # Export today's data for a brand (auto-discovers topics and prompts)
+  OMNIA_API_KEY=ot_xxx npx tsx export-data.ts \\
     --brandId 123e4567-e89b-12d3-a456-426614174000
 
   # Export a specific date range with specific topics
-  OMNIA_API_KEY=ot_xxx npx tsx scripts/api/export-data.ts \\
+  OMNIA_API_KEY=ot_xxx npx tsx export-data.ts \\
     --brandId 123e4567-e89b-12d3-a456-426614174000 \\
     --topicIds abc123,def456 \\
     --startDate 2025-01-01 \\
@@ -304,12 +310,6 @@ Documentation: https://docs.useomnia.com
 
 function formatDateUTC(date: Date): string {
   return date.toISOString().slice(0, 10);
-}
-
-function daysAgoUTC(n: number): Date {
-  const date = new Date();
-  date.setUTCDate(date.getUTCDate() - n);
-  return date;
 }
 
 function isValidDate(dateStr: string): boolean {
@@ -371,7 +371,7 @@ function sleep(ms: number): Promise<void> {
 class OmniaApiClient {
   private readonly baseUrl: string;
   private readonly headers: Record<string, string>;
-  private remainingTokens = 50;
+  private remainingTokens = INITIAL_RATE_LIMIT_TOKENS;
   private totalApiCalls = 0;
   private consecutiveErrors = 0;
 
@@ -407,20 +407,34 @@ class OmniaApiClient {
     this.trackRateLimitHeaders(response);
     this.totalApiCalls++;
 
-    if (response.status === 429 || response.status >= 500) {
-      this.consecutiveErrors++;
-
+    // 429: rate-limited. Wait and retry without counting it as an error.
+    if (response.status === 429) {
       if (retryCount >= MAX_RETRIES) {
         throw new Error(
           `Failed after ${MAX_RETRIES} retries: ${response.status} (${endpoint})`,
         );
       }
+      const waitSeconds = this.parseRetryAfter(response);
+      console.warn(
+        `  429 on ${endpoint}. Waiting ${waitSeconds}s ` +
+          `(attempt ${retryCount + 1}/${MAX_RETRIES})...`,
+      );
+      await sleep(waitSeconds * 1000);
+      return this.get<T>(endpoint, params, retryCount + 1);
+    }
 
-      const waitSeconds =
-        response.status === 429
-          ? this.parseRetryAfter(response)
-          : Math.min(2 ** retryCount, 30);
-
+    // 5xx: server error. Count towards circuit breaker, then retry.
+    if (response.status >= 500) {
+      this.consecutiveErrors++;
+      if (retryCount >= MAX_RETRIES) {
+        throw new Error(
+          `Failed after ${MAX_RETRIES} retries: ${response.status} (${endpoint})`,
+        );
+      }
+      const waitSeconds = Math.min(
+        BACKOFF_BASE_SECONDS ** retryCount,
+        MAX_BACKOFF_SECONDS,
+      );
       console.warn(
         `  ${response.status} on ${endpoint}. Waiting ${waitSeconds}s ` +
           `(attempt ${retryCount + 1}/${MAX_RETRIES})...`,
@@ -494,12 +508,12 @@ class OmniaApiClient {
       const seconds = parseInt(retryAfter, 10);
       if (!isNaN(seconds)) return seconds;
     }
-    return 5;
+    return DEFAULT_RETRY_AFTER_SECONDS;
   }
 
   private async waitForRateLimit(): Promise<void> {
     if (this.remainingTokens < RATE_LIMIT_SAFETY_THRESHOLD) {
-      await sleep(1000);
+      await sleep(RATE_LIMIT_PAUSE_MS);
     }
   }
 }
@@ -875,7 +889,7 @@ function logSummary(
     const counts = stats.rowCounts[level];
     const label = level.charAt(0).toUpperCase() + level.slice(1);
     console.log(
-      `  ${label.padEnd(7)}— SOV: ${counts.shareOfVoice}, Visibility: ${counts.visibility}, Citations: ${counts.citations}`,
+      `  ${label.padEnd(8)} SOV: ${counts.shareOfVoice}, Visibility: ${counts.visibility}, Citations: ${counts.citations}`,
     );
   }
 
