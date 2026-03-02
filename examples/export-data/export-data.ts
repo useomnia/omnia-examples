@@ -46,6 +46,9 @@ interface Brand {
 interface Topic {
   id: string;
   name: string;
+  location: string | null;
+  tags: string[];
+  topicType: TopicType | null;
 }
 
 interface Prompt {
@@ -54,9 +57,18 @@ interface Prompt {
   topicId: string;
 }
 
-type FlatRow = Record<string, string | number | boolean | null>;
+type FlatRow = Record<string, string | number | boolean | string[] | null>;
 type MetricType = "share-of-voice" | "visibility" | "citations";
 type EntityLevel = "brand" | "topic" | "prompt";
+type Engine = (typeof ENGINES)[number];
+type TopicType = (typeof TOPIC_TYPES)[number];
+
+interface EnrichedPrompt extends Prompt {
+  topicName: string;
+  topicLocation: string | null;
+  topicTags: string[];
+  topicType: TopicType | null;
+}
 
 interface ExportConfig {
   apiKey: string;
@@ -68,12 +80,13 @@ interface ExportConfig {
   endDate: string;
   outputDir: string;
   concurrency: number;
+  engines: Engine[];
 }
 
 interface EntityContext {
   brand: Brand;
   topics: Topic[];
-  prompts: Array<Prompt & { topicName: string }>;
+  prompts: EnrichedPrompt[];
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +105,15 @@ const MAX_CONSECUTIVE_ERRORS = 5;
 const BACKOFF_BASE_SECONDS = 2;
 const MAX_BACKOFF_SECONDS = 30;
 const DEFAULT_RETRY_AFTER_SECONDS = 5;
+
+const ENGINES = [
+  "google-ai-overviews",
+  "google-ai-mode",
+  "perplexity",
+  "openai",
+] as const;
+
+const TOPIC_TYPES = ["Branded", "Non-Branded"] as const;
 
 // ---------------------------------------------------------------------------
 // CLI Parsing
@@ -138,6 +160,21 @@ function parseCliArgs(): ExportConfig {
     process.exit(1);
   }
 
+  const enginesRaw = getArgValue(args, "--engines");
+  let engines: Engine[] = [...ENGINES];
+  if (enginesRaw && enginesRaw !== "all") {
+    const requested = enginesRaw.split(",").map((e) => e.trim());
+    const invalid = requested.filter(
+      (e) => !(ENGINES as readonly string[]).includes(e),
+    );
+    if (invalid.length > 0) {
+      console.error(`Error: invalid engine(s): ${invalid.join(", ")}`);
+      console.error(`Valid engines: ${ENGINES.join(", ")}`);
+      process.exit(1);
+    }
+    engines = requested as Engine[];
+  }
+
   return {
     apiKey,
     apiBaseUrl: process.env.OMNIA_API_BASE_URL ?? DEFAULT_API_BASE_URL,
@@ -152,6 +189,7 @@ function parseCliArgs(): ExportConfig {
     endDate,
     outputDir: getArgValue(args, "--outputDir") ?? DEFAULT_OUTPUT_DIR,
     concurrency: parseConcurrency(getArgValue(args, "--concurrency")),
+    engines,
   };
 }
 
@@ -194,6 +232,8 @@ Optional:
   --endDate <YYYY-MM-DD>    End of date range (default: today)
   --outputDir <path>         Output directory (default: ./export)
   --concurrency <number>     Parallel requests (1-${MAX_CONCURRENCY}, default: ${DEFAULT_CONCURRENCY})
+  --engines <e1,e2,...>      AI engines to query (default: all)
+                             Valid: ${ENGINES.join(", ")}
   --help, -h                 Show this help message
 
 Environment:
@@ -227,6 +267,11 @@ Examples:
     --topicIds abc123,def456 \\
     --startDate 2025-01-01 \\
     --endDate 2025-01-31
+
+  # Export only specific engines
+  OMNIA_API_KEY=ot_xxx tsx export-data.ts \\
+    --brandId 123e4567-e89b-12d3-a456-426614174000 \\
+    --engines perplexity,openai
 
 Documentation: https://docs.useomnia.com
 `);
@@ -486,9 +531,12 @@ async function discoverEntities(
         `/topics/${topic.id}/prompts`,
         "prompts",
       );
-      return prompts.map((p): Prompt & { topicName: string } => ({
+      return prompts.map((p): EnrichedPrompt => ({
         ...p,
         topicName: topic.name,
+        topicLocation: topic.location,
+        topicTags: topic.tags,
+        topicType: topic.topicType,
       }));
     },
   );
@@ -580,53 +628,80 @@ interface FetchTask {
   entityId: string;
   apiPath: string;
   context: Record<string, unknown>;
+  extraParams: Record<string, string>;
 }
 
-function buildDailyTasks(entities: EntityContext, date: string): FetchTask[] {
+function buildDailyTasks(entities: EntityContext, config: ExportConfig): FetchTask[] {
   const { brand, topics, prompts } = entities;
   const tasks: FetchTask[] = [];
 
-  const brandCtx = { brandId: brand.id, brandName: brand.name };
+  const brandCtx = {
+    brandId: brand.id,
+    brandName: brand.name,
+    brandDomain: brand.domain,
+  };
 
-  for (const metric of METRICS) {
-    tasks.push({
-      level: "brand",
-      metric,
-      entityId: brand.id,
-      apiPath: `/brands/${brand.id}/${metric}/aggregates`,
-      context: brandCtx,
-    });
-  }
+  for (const engine of config.engines) {
+    const engineParam = { engine };
 
-  for (const topic of topics) {
-    const topicCtx = { ...brandCtx, topicId: topic.id, topicName: topic.name };
+    // Brand-level
     for (const metric of METRICS) {
       tasks.push({
-        level: "topic",
+        level: "brand",
         metric,
-        entityId: topic.id,
-        apiPath: `/topics/${topic.id}/${metric}/aggregates`,
-        context: topicCtx,
+        entityId: brand.id,
+        apiPath: `/brands/${brand.id}/${metric}/aggregates`,
+        context: { ...brandCtx, engine },
+        extraParams: engineParam,
       });
     }
-  }
 
-  for (const prompt of prompts) {
-    const promptCtx = {
-      ...brandCtx,
-      topicId: prompt.topicId,
-      topicName: prompt.topicName,
-      promptId: prompt.id,
-      promptQuery: prompt.query,
-    };
-    for (const metric of METRICS) {
-      tasks.push({
-        level: "prompt",
-        metric,
-        entityId: prompt.id,
-        apiPath: `/prompts/${prompt.id}/${metric}/aggregates`,
-        context: promptCtx,
-      });
+    // Topic-level (denormalize topic properties)
+    for (const topic of topics) {
+      const topicCtx = {
+        ...brandCtx,
+        topicId: topic.id,
+        topicName: topic.name,
+        topicLocation: topic.location,
+        topicTags: topic.tags,
+        topicType: topic.topicType,
+        engine,
+      };
+      for (const metric of METRICS) {
+        tasks.push({
+          level: "topic",
+          metric,
+          entityId: topic.id,
+          apiPath: `/topics/${topic.id}/${metric}/aggregates`,
+          context: topicCtx,
+          extraParams: engineParam,
+        });
+      }
+    }
+
+    // Prompt-level (denormalize topic properties)
+    for (const prompt of prompts) {
+      const promptCtx = {
+        ...brandCtx,
+        topicId: prompt.topicId,
+        topicName: prompt.topicName,
+        topicLocation: prompt.topicLocation,
+        topicTags: prompt.topicTags,
+        topicType: prompt.topicType,
+        promptId: prompt.id,
+        promptQuery: prompt.query,
+        engine,
+      };
+      for (const metric of METRICS) {
+        tasks.push({
+          level: "prompt",
+          metric,
+          entityId: prompt.id,
+          apiPath: `/prompts/${prompt.id}/${metric}/aggregates`,
+          context: promptCtx,
+          extraParams: engineParam,
+        });
+      }
     }
   }
 
@@ -640,11 +715,13 @@ function buildDailyTasks(entities: EntityContext, date: string): FetchTask[] {
 async function fetchAllDailyAggregates(
   client: OmniaApiClient,
   entities: EntityContext,
+  config: ExportConfig,
   dates: string[],
-  concurrency: number,
 ): Promise<{ rows: ExportRows; errors: ExportError[] }> {
   const rows = createExportRows();
   const errors: ExportError[] = [];
+
+  const tasks = buildDailyTasks(entities, config);
 
   console.log("Fetching daily aggregates...");
 
@@ -652,14 +729,12 @@ async function fetchAllDailyAggregates(
     const date = dates[i];
     console.log(`  [${i + 1}/${dates.length}] ${date}`);
 
-    const tasks = buildDailyTasks(entities, date);
-
-    await mapWithConcurrency(tasks, concurrency, async (task) => {
+    await mapWithConcurrency(tasks, config.concurrency, async (task) => {
       try {
         const aggregates = await client.fetchAllPages<Record<string, unknown>>(
           task.apiPath,
           "aggregates",
-          { startDate: date, endDate: date },
+          { startDate: date, endDate: date, ...task.extraParams },
         );
         const flatRows = flattenAggregates(
           aggregates,
@@ -728,21 +803,28 @@ function formatDuration(ms: number): string {
 
 function logConfig(config: ExportConfig): void {
   console.log("\n=== Omnia Data Export ===\n");
-  console.log(`API:        ${config.apiBaseUrl}`);
-  console.log(`Brand ID:   ${config.brandId}`);
-  console.log(`Date range: ${config.startDate} to ${config.endDate}`);
-  console.log(`Output:     ${config.outputDir}`);
+  console.log(`API:         ${config.apiBaseUrl}`);
+  console.log(`Brand ID:    ${config.brandId}`);
+  console.log(`Date range:  ${config.startDate} to ${config.endDate}`);
+  console.log(`Engines:     ${config.engines.join(", ")}`);
+  console.log(`Output:      ${config.outputDir}`);
   console.log(`Concurrency: ${config.concurrency}\n`);
 }
 
-function logExportPlan(entities: EntityContext, days: number): void {
+function logExportPlan(
+  entities: EntityContext,
+  days: number,
+  config: ExportConfig,
+): void {
+  const engineCount = config.engines.length;
   const entityCount = 1 + entities.topics.length + entities.prompts.length;
-  const tasksPerDay = entityCount * METRICS.length;
+  const tasksPerDay = entityCount * METRICS.length * engineCount;
 
   console.log(`\nExport plan:`);
   console.log(
     `  ${entityCount} entities (1 brand + ${entities.topics.length} topics + ${entities.prompts.length} prompts)`,
   );
+  console.log(`  ${engineCount} engine(s): ${config.engines.join(", ")}`);
   console.log(
     `  ${days} days x ${tasksPerDay} tasks/day = ${days * tasksPerDay} total API calls`,
   );
@@ -801,12 +883,19 @@ function buildManifest(
     exportedAt: new Date().toISOString(),
     apiBaseUrl: config.apiBaseUrl,
     dateRange: { startDate: config.startDate, endDate: config.endDate },
+    engines: config.engines,
     brand: {
       id: entities.brand.id,
       name: entities.brand.name,
       domain: entities.brand.domain,
     },
-    topics: entities.topics.map((t) => ({ id: t.id, name: t.name })),
+    topics: entities.topics.map((t) => ({
+      id: t.id,
+      name: t.name,
+      location: t.location,
+      tags: t.tags,
+      topicType: t.topicType,
+    })),
     prompts: entities.prompts.map((p) => ({
       id: p.id,
       query: p.query,
@@ -838,14 +927,14 @@ async function main(): Promise<void> {
   const entities = await discoverEntities(client, config);
   const dates = generateDateRange(config.startDate, config.endDate);
 
-  logExportPlan(entities, dates.length);
+  logExportPlan(entities, dates.length, config);
 
   const startTime = Date.now();
   const { rows, errors } = await fetchAllDailyAggregates(
     client,
     entities,
+    config,
     dates,
-    config.concurrency,
   );
   const durationMs = Date.now() - startTime;
 
