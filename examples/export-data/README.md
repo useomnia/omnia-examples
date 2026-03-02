@@ -2,7 +2,9 @@
 
 Export daily prompt-level performance data from the Omnia API into flat JSON files ready for BI tools (Looker Studio, BigQuery, Tableau, etc.).
 
-The script fetches share of voice, visibility, and citations at prompt granularity. Data is queried **per engine** (Google AI Overviews, Google AI Mode, Perplexity, OpenAI) and every output row is fully denormalized — brand info, topic properties, and engine are included in every row so you can load the files directly into any analytics tool without joins. Consumers aggregate up to topic or brand level as needed.
+The script fetches share of voice, visibility, and citations at prompt granularity — the most detailed level available. Data is queried **per engine** (Google AI Overviews, Google AI Mode, Perplexity, OpenAI) and every output row is fully denormalized — brand info, topic properties, and engine are included in every row so you can load the files directly into any analytics tool without joins.
+
+Since the data is exported at the finest grain, you can roll up metrics by any dimension in your BI tool: group by `topicId` for topic-level aggregates, by `brandId` for brand-level, by `engine` for engine comparisons, or any combination.
 
 ## Quick start
 
