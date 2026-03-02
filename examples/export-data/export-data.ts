@@ -4,7 +4,7 @@
  * Omnia Data Export Script
  *
  * Exports daily brand performance data (share of voice, visibility, citations)
- * from the Omnia public API at prompt granularity.
+ * from the Omnia public API at brand, topic, and prompt granularity.
  *
  * Designed as a reference implementation for integrating Omnia analytics data
  * with BI tools (Looker Studio, BigQuery, Tableau, etc.) or ingesting into
@@ -59,6 +59,7 @@ interface Prompt {
 
 type FlatRow = Record<string, string | number | boolean | string[] | null>;
 type MetricType = "share-of-voice" | "visibility" | "citations";
+type EntityLevel = "brand" | "topic" | "prompt";
 type Engine = (typeof ENGINES)[number];
 type TopicType = (typeof TOPIC_TYPES)[number];
 
@@ -215,8 +216,8 @@ function printUsage(): void {
 Omnia Data Export Script
 ========================
 
-Exports daily prompt-level performance data from the Omnia public API.
-Produces flat, denormalized JSON files ready for BI tools.
+Exports daily brand performance data from the Omnia public API.
+Produces flat, denormalized JSON files at brand, topic, and prompt levels.
 
 Usage:
   OMNIA_API_KEY=ot_xxx tsx export-data.ts --brandId <uuid> [options]
@@ -242,9 +243,18 @@ Environment:
 Output:
   export/
   ├── manifest.json           Export metadata and entity inventory
-  ├── share-of-voice.json     Prompt-level share of voice rows
-  ├── visibility.json         Prompt-level visibility rows
-  └── citations.json          Prompt-level citation rows
+  ├── brand/
+  │   ├── share-of-voice.json
+  │   ├── visibility.json
+  │   └── citations.json
+  ├── topic/
+  │   ├── share-of-voice.json
+  │   ├── visibility.json
+  │   └── citations.json
+  └── prompt/
+      ├── share-of-voice.json
+      ├── visibility.json
+      └── citations.json
 
 Examples:
   # Export today's data for a brand (auto-discovers topics and prompts)
@@ -580,28 +590,40 @@ function flattenAggregates(
 // ---------------------------------------------------------------------------
 
 const METRICS: MetricType[] = ["share-of-voice", "visibility", "citations"];
+const LEVELS: EntityLevel[] = ["brand", "topic", "prompt"];
 
 type MetricRows = Record<MetricType, FlatRow[]>;
+type ExportRows = Record<EntityLevel, MetricRows>;
 
 interface ExportError {
   date: string;
+  level: EntityLevel;
   metric: MetricType;
   entityId: string;
   error: string;
 }
 
-function createEmptyRows(): MetricRows {
+function createEmptyMetricRows(): MetricRows {
   return { "share-of-voice": [], visibility: [], citations: [] };
+}
+
+function createExportRows(): ExportRows {
+  return {
+    brand: createEmptyMetricRows(),
+    topic: createEmptyMetricRows(),
+    prompt: createEmptyMetricRows(),
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Task Descriptors
 //
-// A flat list of { metric, entityId, apiPath, context } objects.
+// A flat list of { level, metric, entityId, apiPath, context } objects.
 // No closures, no execute methods. Just data describing what to fetch.
 // ---------------------------------------------------------------------------
 
 interface FetchTask {
+  level: EntityLevel;
   metric: MetricType;
   entityId: string;
   apiPath: string;
@@ -610,7 +632,7 @@ interface FetchTask {
 }
 
 function buildDailyTasks(entities: EntityContext, config: ExportConfig): FetchTask[] {
-  const { brand, prompts } = entities;
+  const { brand, topics, prompts } = entities;
   const tasks: FetchTask[] = [];
 
   const brandCtx = {
@@ -620,8 +642,46 @@ function buildDailyTasks(entities: EntityContext, config: ExportConfig): FetchTa
   };
 
   for (const engine of config.engines) {
+    const engineParam = { engine };
+
+    // Brand-level
+    for (const metric of METRICS) {
+      tasks.push({
+        level: "brand",
+        metric,
+        entityId: brand.id,
+        apiPath: `/brands/${brand.id}/${metric}/aggregates`,
+        context: { ...brandCtx, engine },
+        extraParams: engineParam,
+      });
+    }
+
+    // Topic-level
+    for (const topic of topics) {
+      const topicCtx = {
+        ...brandCtx,
+        topicId: topic.id,
+        topicName: topic.name,
+        topicLocation: topic.location,
+        topicTags: topic.tags,
+        topicType: topic.topicType,
+        engine,
+      };
+      for (const metric of METRICS) {
+        tasks.push({
+          level: "topic",
+          metric,
+          entityId: topic.id,
+          apiPath: `/topics/${topic.id}/${metric}/aggregates`,
+          context: topicCtx,
+          extraParams: engineParam,
+        });
+      }
+    }
+
+    // Prompt-level
     for (const prompt of prompts) {
-      const ctx = {
+      const promptCtx = {
         ...brandCtx,
         topicId: prompt.topicId,
         topicName: prompt.topicName,
@@ -634,11 +694,12 @@ function buildDailyTasks(entities: EntityContext, config: ExportConfig): FetchTa
       };
       for (const metric of METRICS) {
         tasks.push({
+          level: "prompt",
           metric,
           entityId: prompt.id,
           apiPath: `/prompts/${prompt.id}/${metric}/aggregates`,
-          context: ctx,
-          extraParams: { engine },
+          context: promptCtx,
+          extraParams: engineParam,
         });
       }
     }
@@ -656,8 +717,8 @@ async function fetchAllDailyAggregates(
   entities: EntityContext,
   config: ExportConfig,
   dates: string[],
-): Promise<{ rows: MetricRows; errors: ExportError[] }> {
-  const rows = createEmptyRows();
+): Promise<{ rows: ExportRows; errors: ExportError[] }> {
+  const rows = createExportRows();
   const errors: ExportError[] = [];
 
   const tasks = buildDailyTasks(entities, config);
@@ -681,10 +742,11 @@ async function fetchAllDailyAggregates(
           task.context,
           task.metric,
         );
-        rows[task.metric].push(...flatRows);
+        rows[task.level][task.metric].push(...flatRows);
       } catch (error) {
         errors.push({
           date,
+          level: task.level,
           metric: task.metric,
           entityId: task.entityId,
           error: String(error),
@@ -701,16 +763,23 @@ async function fetchAllDailyAggregates(
 // ---------------------------------------------------------------------------
 
 function writeExportFiles(
-  rows: MetricRows,
+  rows: ExportRows,
   manifest: Record<string, unknown>,
   outputDir: string,
 ): void {
-  fs.mkdirSync(outputDir, { recursive: true });
+  for (const level of LEVELS) {
+    fs.mkdirSync(path.join(outputDir, level), { recursive: true });
+  }
 
   writeJsonFile(path.join(outputDir, "manifest.json"), manifest);
 
-  for (const metric of METRICS) {
-    writeJsonFile(path.join(outputDir, `${metric}.json`), rows[metric]);
+  for (const level of LEVELS) {
+    for (const metric of METRICS) {
+      writeJsonFile(
+        path.join(outputDir, level, `${metric}.json`),
+        rows[level][metric],
+      );
+    }
   }
 }
 
@@ -748,12 +817,12 @@ function logExportPlan(
   config: ExportConfig,
 ): void {
   const engineCount = config.engines.length;
-  const promptCount = entities.prompts.length;
-  const tasksPerDay = promptCount * METRICS.length * engineCount;
+  const entityCount = 1 + entities.topics.length + entities.prompts.length;
+  const tasksPerDay = entityCount * METRICS.length * engineCount;
 
   console.log(`\nExport plan:`);
   console.log(
-    `  ${promptCount} prompts (across ${entities.topics.length} topics)`,
+    `  ${entityCount} entities (1 brand + ${entities.topics.length} topics + ${entities.prompts.length} prompts)`,
   );
   console.log(`  ${engineCount} engine(s): ${config.engines.join(", ")}`);
   console.log(
@@ -763,7 +832,7 @@ function logExportPlan(
 }
 
 function logSummary(
-  rows: MetricRows,
+  rows: ExportRows,
   errors: ExportError[],
   totalApiCalls: number,
   durationMs: number,
@@ -774,15 +843,21 @@ function logSummary(
   console.log(`API calls:  ${totalApiCalls}`);
   console.log(`Rows exported:`);
 
-  for (const metric of METRICS) {
-    console.log(`  ${metric}: ${rows[metric].length}`);
+  for (const level of LEVELS) {
+    const label = level.charAt(0).toUpperCase() + level.slice(1);
+    const sov = rows[level]["share-of-voice"].length;
+    const vis = rows[level]["visibility"].length;
+    const cit = rows[level]["citations"].length;
+    console.log(
+      `  ${label.padEnd(8)} SOV: ${sov}, Visibility: ${vis}, Citations: ${cit}`,
+    );
   }
 
   if (errors.length > 0) {
     console.log(`\nErrors (${errors.length}):`);
     for (const err of errors.slice(0, 10)) {
       console.log(
-        `  ${err.date} ${err.metric} [${err.entityId}]: ${err.error}`,
+        `  ${err.date} ${err.level}/${err.metric} [${err.entityId}]: ${err.error}`,
       );
     }
     if (errors.length > 10) {
@@ -800,7 +875,7 @@ function logSummary(
 function buildManifest(
   config: ExportConfig,
   entities: EntityContext,
-  rows: MetricRows,
+  rows: ExportRows,
   totalApiCalls: number,
   durationMs: number,
 ): Record<string, unknown> {
@@ -830,7 +905,10 @@ function buildManifest(
       totalApiCalls,
       durationMs,
       rowCounts: Object.fromEntries(
-        METRICS.map((m) => [m, rows[m].length]),
+        LEVELS.map((level) => [
+          level,
+          Object.fromEntries(METRICS.map((m) => [m, rows[level][m].length])),
+        ]),
       ),
     },
   };

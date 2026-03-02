@@ -1,10 +1,8 @@
 # Export Data
 
-Export daily prompt-level performance data from the Omnia API into flat JSON files ready for BI tools (Looker Studio, BigQuery, Tableau, etc.).
+Export daily brand performance data from the Omnia API into flat JSON files ready for BI tools (Looker Studio, BigQuery, Tableau, etc.).
 
-The script fetches share of voice, visibility, and citations at prompt granularity — the most detailed level available. Data is queried **per engine** (Google AI Overviews, Google AI Mode, Perplexity, OpenAI) and every output row is fully denormalized — brand info, topic properties, and engine are included in every row so you can load the files directly into any analytics tool without joins.
-
-Since the data is exported at the finest grain, you can roll up metrics by any dimension in your BI tool: group by `topicId` for topic-level aggregates, by `brandId` for brand-level, by `engine` for engine comparisons, or any combination.
+The script fetches share of voice, visibility, and citations at three levels of granularity: brand, topic, and prompt. Data is queried **per engine** (Google AI Overviews, Google AI Mode, Perplexity, OpenAI) and every output row is fully denormalized so you can load the files directly into any analytics tool without joins.
 
 ## Quick start
 
@@ -52,34 +50,50 @@ Use `--engines` to narrow to specific engines (e.g. `--engines perplexity,openai
 
 ## Output
 
-The script produces 3 JSON files (one per metric) plus a manifest:
+The script produces 9 JSON files (3 metrics x 3 levels) plus a manifest:
 
 ```
 export/
 ├── manifest.json
-├── share-of-voice.json
-├── visibility.json
-└── citations.json
+├── brand/
+│   ├── share-of-voice.json
+│   ├── visibility.json
+│   └── citations.json
+├── topic/
+│   ├── share-of-voice.json
+│   ├── visibility.json
+│   └── citations.json
+└── prompt/
+    ├── share-of-voice.json
+    ├── visibility.json
+    └── citations.json
 ```
+
+### Why all three levels?
+
+Metrics like visibility use server-side unique counting (deduplication across prompts) that **cannot be recomputed** by aggregating prompt-level data. Similarly, share of voice at the topic level is not a simple average of per-prompt ratios — it requires summing raw mention counts first, then computing the ratio. To avoid incorrect results, always use the data from the appropriate level rather than aggregating lower-level data yourself.
+
+### Recommended BI setup
+
+For BI tools like Looker Studio or Tableau, create **one data source (table/view) per entity level**:
+
+- **Brand table** — `brand/share-of-voice.json`, `brand/visibility.json`, `brand/citations.json`
+- **Topic table** — `topic/share-of-voice.json`, etc.
+- **Prompt table** — `prompt/share-of-voice.json`, etc.
+
+Each table has its own set of context fields and can be filtered/sliced by `engine`, `date`, `topicType`, etc. Do **not** attempt to roll up prompt-level rows to derive topic or brand metrics.
 
 ### Row structure
 
-Every row is self-contained and fully denormalized. Brand info, topic properties, prompt info, and the engine are included in every row so the files can be loaded directly into BI tools without joins.
+Every row is self-contained and fully denormalized. Brand info, topic properties, and the engine are included in every row so the files can be loaded directly into BI tools without joins.
 
-**Share of voice** (`share-of-voice.json`):
+**Brand-level share of voice** (`brand/share-of-voice.json`):
 
 ```json
 {
   "brandId": "abc-123",
   "brandName": "My Brand",
   "brandDomain": "mybrand.com",
-  "topicId": "topic-1",
-  "topicName": "AI Assistants",
-  "topicLocation": "us",
-  "topicTags": ["core"],
-  "topicType": "Non-Branded",
-  "promptId": "prompt-1",
-  "promptQuery": "best ai assistant for coding",
   "engine": "perplexity",
   "date": "2025-06-15",
   "mentionedBrand": "Competitor A",
@@ -91,7 +105,7 @@ Every row is self-contained and fully denormalized. Brand info, topic properties
 }
 ```
 
-**Citations** (`citations.json`) have a different shape:
+**Topic-level** rows add `topicId`, `topicName`, `topicLocation`, `topicTags`, and `topicType`:
 
 ```json
 {
@@ -103,8 +117,25 @@ Every row is self-contained and fully denormalized. Brand info, topic properties
   "topicLocation": "us",
   "topicTags": ["core"],
   "topicType": "Non-Branded",
-  "promptId": "prompt-1",
-  "promptQuery": "best ai assistant for coding",
+  "engine": "google-ai-overviews",
+  "date": "2025-06-15",
+  "mentionedBrand": "Competitor A",
+  "mentionedDomain": "competitor.com",
+  "mentionCount": 12,
+  "rank": 1,
+  "shareOfVoice": 0.22
+}
+```
+
+**Prompt-level** rows add `promptId` and `promptQuery` on top of topic fields.
+
+**Citations** have a different shape:
+
+```json
+{
+  "brandId": "abc-123",
+  "brandName": "My Brand",
+  "brandDomain": "mybrand.com",
   "engine": "openai",
   "date": "2025-06-15",
   "citedDomain": "example.com",
@@ -116,18 +147,16 @@ Every row is self-contained and fully denormalized. Brand info, topic properties
 }
 ```
 
-**Visibility** (`visibility.json`) has the same context fields as share of voice, with `visibility` and `rank` instead of `mentionCount` and `shareOfVoice`.
-
 ### Manifest
 
-`manifest.json` contains export metadata: date range, engines, brand info, the full list of topics (including location, tags, and topic type) and prompts, and row counts per metric. Use it to verify the export completed correctly or to build a lookup table for topic/prompt IDs.
+`manifest.json` contains export metadata: date range, engines, brand info, the full list of topics (including location, tags, and topic type) and prompts, and row counts per level and metric. Use it to verify the export completed correctly or to build a lookup table for topic/prompt IDs.
 
 ## How it works
 
 1. **Discovery**: Fetches the brand, then auto-discovers all topics (with their location, tags, and topic type) and prompts under it (unless filtered with `--topicIds` / `--promptIds`).
-2. **Daily aggregates**: For each day in the date range, fetches all metric/engine combinations for every prompt. Each engine is queried separately so rows contain per-engine breakdowns. Uses concurrent workers (configurable with `--concurrency`) and handles pagination automatically.
+2. **Daily aggregates**: For each day in the date range, fetches all metric/level/engine combinations for every entity. Each engine is queried separately so rows contain per-engine breakdowns. Uses concurrent workers (configurable with `--concurrency`) and handles pagination automatically.
 3. **Retries**: Retries on 429 (rate limited) using the `Retry-After` header, and on 5xx (server error) with exponential backoff. Only 5xx errors count toward the circuit breaker, which aborts after 5 consecutive server failures.
-4. **Output**: Writes denormalized JSON files — one per metric. Brand info, topic properties, and engine are denormalized into every row.
+4. **Output**: Writes denormalized JSON files organized by level (brand/topic/prompt). Topic properties and engine are denormalized into every row.
 
 ## Examples
 
@@ -154,12 +183,12 @@ tsx export-data.ts --brandId abc-123 --concurrency 8
 
 ## Performance and concurrency
 
-The script processes one day at a time. Within each day, it fetches multiple metrics, prompts, and engines in parallel using a worker pool controlled by `--concurrency` (default: 4).
+The script processes one day at a time. Within each day, it fetches multiple metrics, entities, and engines in parallel using a worker pool controlled by `--concurrency` (default: 4).
 
-The total number of API calls depends on how many prompts and engines your export includes. For a brand with 15 topics and 75 prompts across all 4 engines, exporting a full month looks roughly like this:
+The total number of API calls depends on how many topics, prompts, and engines your export includes. For a brand with 15 topics and 75 prompts across all 4 engines, exporting a full month looks roughly like this:
 
-- **75 prompts** x 3 metrics x 4 engines = 900 API calls per day
-- **31 days** = ~27,900 API calls total
+- **91 entities** (1 brand + 15 topics + 75 prompts) x 3 metrics x 4 engines = 1,092 API calls per day
+- **31 days** = ~33,800 API calls total
 
 At the default concurrency of 4, this takes several minutes. Higher concurrency (e.g. `--concurrency 8`) reduces the time but consumes rate limit tokens faster. You can also reduce the number of engines with `--engines` to cut the call count proportionally.
 
