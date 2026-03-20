@@ -1,6 +1,6 @@
 # Export Data
 
-Export daily brand performance data from the Omnia API into flat JSON files ready for BI tools (Looker Studio, BigQuery, Tableau, etc.).
+Export daily brand performance data from the [Omnia public API](https://docs.useomnia.com/api) into flat JSON files ready for BI tools (Looker Studio, BigQuery, Tableau, etc.).
 
 The script fetches share of voice, visibility, and citations at three levels of granularity: brand, topic, and prompt. Data is queried **per engine** (Google AI Overviews, Google AI Mode, Perplexity, OpenAI) and every output row is fully denormalized so you can load the files directly into any analytics tool without joins.
 
@@ -127,9 +127,47 @@ Every row is self-contained and fully denormalized. Brand info, topic properties
 }
 ```
 
-**Prompt-level** rows add `promptId` and `promptQuery` on top of topic fields.
+**Prompt-level share of voice** (`prompt/share-of-voice.json`) adds `promptId` and `promptQuery` on top of topic fields:
 
-**Citations** have a different shape:
+```json
+{
+  "brandId": "abc-123",
+  "brandName": "My Brand",
+  "brandDomain": "mybrand.com",
+  "topicId": "topic-1",
+  "topicName": "AI Assistants",
+  "topicLocation": "us",
+  "topicTags": ["core"],
+  "topicType": "Non-Branded",
+  "promptId": "prompt-1",
+  "promptQuery": "what is the best AI assistant",
+  "engine": "google-ai-overviews",
+  "date": "2025-06-15",
+  "mentionedBrand": "Competitor A",
+  "mentionedDomain": "competitor.com",
+  "mentionCount": 3,
+  "rank": 1,
+  "shareOfVoice": 0.33
+}
+```
+
+**Visibility** (`brand/visibility.json`) follows the same level pattern (brand → topic → prompt) but with visibility-specific metric fields:
+
+```json
+{
+  "brandId": "abc-123",
+  "brandName": "My Brand",
+  "brandDomain": "mybrand.com",
+  "engine": "perplexity",
+  "date": "2025-06-15",
+  "mentionedBrand": "Competitor A",
+  "mentionedDomain": "competitor.com",
+  "visibility": 0.42,
+  "rank": 1
+}
+```
+
+**Citations** have a different shape. At brand level (`brand/citations.json`):
 
 ```json
 {
@@ -146,6 +184,8 @@ Every row is self-contained and fully denormalized. Brand info, topic properties
   "sourceType": "third_party"
 }
 ```
+
+Topic-level and prompt-level citations add the same context fields (`topicId`, `topicName`, etc. and `promptId`, `promptQuery`) as shown in the share of voice examples above.
 
 ### Manifest
 
