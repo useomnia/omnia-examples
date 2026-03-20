@@ -167,7 +167,7 @@ Every row is self-contained and fully denormalized. Brand info, topic properties
 }
 ```
 
-**Citations** have a different shape. At brand level (`brand/citations.json`):
+**Citations** track which URLs were cited in AI answers. Instead of brand mention fields, each row describes a single cited source (`brand/citations.json`):
 
 ```json
 {
