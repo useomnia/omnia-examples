@@ -185,7 +185,7 @@ Every row is self-contained and fully denormalized. Brand info, topic properties
 }
 ```
 
-Topic- and prompt-level citations add the same context fields (`topicId`, `topicName`, etc. and `promptId`, `promptQuery`) as shown in the share of voice examples above.
+Topic-level and prompt-level citations add the same context fields (`topicId`, `topicName`, etc. and `promptId`, `promptQuery`) as shown in the share of voice examples above.
 
 ### Manifest
 
