@@ -2,7 +2,7 @@
 
 Export daily brand performance data from the [Omnia public API](https://docs.useomnia.com/api) into flat JSON files ready for BI tools (Looker Studio, BigQuery, Tableau, etc.).
 
-The script fetches share of voice, visibility, and citations at three levels of granularity: brand, topic, and prompt. Data is queried **per engine** (Google AI Overviews, Google AI Mode, Perplexity, OpenAI) and every output row is fully denormalized so you can load the files directly into any analytics tool without joins.
+The script fetches share of voice, visibility, citations, and sentiment at three levels of granularity: brand, topic, and prompt. Data is queried **per engine** (Google AI Overviews, Google AI Mode, Perplexity, OpenAI) and every output row is fully denormalized so you can load the files directly into any analytics tool without joins.
 
 ## Quick start
 
@@ -50,7 +50,7 @@ Use `--engines` to narrow to specific engines (e.g. `--engines perplexity,openai
 
 ## Output
 
-The script produces 9 JSON files (3 metrics x 3 levels) plus a manifest:
+The script produces 12 JSON files (4 metrics x 3 levels) plus a manifest:
 
 ```
 export/
@@ -58,15 +58,18 @@ export/
 ├── brand/
 │   ├── share-of-voice.json
 │   ├── visibility.json
-│   └── citations.json
+│   ├── citations.json
+│   └── sentiment.json
 ├── topic/
 │   ├── share-of-voice.json
 │   ├── visibility.json
-│   └── citations.json
+│   ├── citations.json
+│   └── sentiment.json
 └── prompt/
     ├── share-of-voice.json
     ├── visibility.json
-    └── citations.json
+    ├── citations.json
+    └── sentiment.json
 ```
 
 ### Why all three levels?
@@ -187,6 +190,30 @@ Every row is self-contained and fully denormalized. Brand info, topic properties
 
 Topic-level and prompt-level citations add the same context fields (`topicId`, `topicName`, etc. and `promptId`, `promptQuery`) as shown in the share of voice examples above.
 
+**Sentiment** has a different shape from other metrics. Each row is a brand-feature pair with endorsed, undermined, and neutral mention counts. At brand level (`brand/sentiment.json`):
+
+```json
+{
+  "brandId": "abc-123",
+  "brandName": "My Brand",
+  "brandDomain": "mybrand.com",
+  "engine": "perplexity",
+  "date": "2025-06-15",
+  "mentionedBrand": "Competitor A",
+  "mentionedDomain": "competitor.com",
+  "relationship": "competitor",
+  "mentionedBrandRank": 2,
+  "featureName": "customer support",
+  "featureDescription": "Quality and responsiveness of customer support",
+  "endorsedMentions": 8,
+  "underminedMentions": 2,
+  "neutralMentions": 4,
+  "totalMentions": 14
+}
+```
+
+Topic-level and prompt-level sentiment rows add the same context fields as shown in the share of voice examples above.
+
 ### Manifest
 
 `manifest.json` contains export metadata: date range, engines, brand info, the full list of topics (including location, tags, and topic type) and prompts, and row counts per level and metric. Use it to verify the export completed correctly or to build a lookup table for topic/prompt IDs.
@@ -194,7 +221,7 @@ Topic-level and prompt-level citations add the same context fields (`topicId`, `
 ## How it works
 
 1. **Discovery**: Fetches the brand, then auto-discovers all topics (with their location, tags, and topic type) and prompts under it (unless filtered with `--topicIds` / `--promptIds`).
-2. **Daily aggregates**: For each day in the date range, fetches all metric/level/engine combinations for every entity. Each engine is queried separately so rows contain per-engine breakdowns. Uses concurrent workers (configurable with `--concurrency`) and handles pagination automatically.
+2. **Daily aggregates**: For each day in the date range, fetches all four metric/level/engine combinations for every entity. Each engine is queried separately so rows contain per-engine breakdowns. Uses concurrent workers (configurable with `--concurrency`) and handles pagination automatically.
 3. **Retries**: Retries on 429 (rate limited) using the `Retry-After` header, and on 5xx (server error) with exponential backoff. Only 5xx errors count toward the circuit breaker, which aborts after 5 consecutive server failures.
 4. **Output**: Writes denormalized JSON files organized by level (brand/topic/prompt). Topic properties and engine are denormalized into every row.
 
@@ -227,8 +254,8 @@ The script processes one day at a time. Within each day, it fetches multiple met
 
 The total number of API calls depends on how many topics, prompts, and engines your export includes. For a brand with 15 topics and 75 prompts across all 4 engines, exporting a full month looks roughly like this:
 
-- **91 entities** (1 brand + 15 topics + 75 prompts) x 3 metrics x 4 engines = 1,092 API calls per day
-- **31 days** = ~33,800 API calls total
+- **91 entities** (1 brand + 15 topics + 75 prompts) x 4 metrics x 4 engines = 1,456 API calls per day
+- **31 days** = ~45,100 API calls total
 
 At the default concurrency of 4, this takes several minutes. Higher concurrency (e.g. `--concurrency 8`) reduces the time but consumes rate limit tokens faster. You can also reduce the number of engines with `--engines` to cut the call count proportionally.
 

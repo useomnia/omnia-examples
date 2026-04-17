@@ -8,7 +8,7 @@ Each example is a standalone script with zero dependencies on the Omnia codebase
 
 | Example                                | Description                                                                                                   |
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| [export-data](./examples/export-data/) | Export daily brand performance data (share of voice, visibility, citations) into flat JSON files for BI tools |
+| [export-data](./examples/export-data/) | Export daily brand performance data (share of voice, visibility, citations, sentiment) into flat JSON files for BI tools |
 
 ## Prerequisites
 

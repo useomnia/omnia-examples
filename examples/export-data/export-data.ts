@@ -3,8 +3,8 @@
 /**
  * Omnia Data Export Script
  *
- * Exports daily brand performance data (share of voice, visibility, citations)
- * from the Omnia public API at brand, topic, and prompt granularity.
+ * Exports daily brand performance data (share of voice, visibility, citations,
+ * sentiment) from the Omnia public API at brand, topic, and prompt granularity.
  *
  * Designed as a reference implementation for integrating Omnia analytics data
  * with BI tools (Looker Studio, BigQuery, Tableau, etc.) or ingesting into
@@ -58,7 +58,7 @@ interface Prompt {
 }
 
 type FlatRow = Record<string, string | number | boolean | string[] | null>;
-type MetricType = "share-of-voice" | "visibility" | "citations";
+type MetricType = "share-of-voice" | "visibility" | "citations" | "sentiment";
 type EntityLevel = "brand" | "topic" | "prompt";
 type Engine = (typeof ENGINES)[number];
 type TopicType = (typeof TOPIC_TYPES)[number];
@@ -218,6 +218,7 @@ Omnia Data Export Script
 
 Exports daily brand performance data from the Omnia public API.
 Produces flat, denormalized JSON files at brand, topic, and prompt levels.
+Metrics: share of voice, visibility, citations, and sentiment.
 
 Usage:
   OMNIA_API_KEY=ot_xxx tsx export-data.ts --brandId <uuid> [options]
@@ -246,15 +247,18 @@ Output:
   ├── brand/
   │   ├── share-of-voice.json
   │   ├── visibility.json
-  │   └── citations.json
+  │   ├── citations.json
+  │   └── sentiment.json
   ├── topic/
   │   ├── share-of-voice.json
   │   ├── visibility.json
-  │   └── citations.json
+  │   ├── citations.json
+  │   └── sentiment.json
   └── prompt/
       ├── share-of-voice.json
       ├── visibility.json
-      └── citations.json
+      ├── citations.json
+      └── sentiment.json
 
 Examples:
   # Export today's data for a brand (auto-discovers topics and prompts)
@@ -567,6 +571,7 @@ const FIELD_RENAMES: Record<MetricType, Record<string, string>> = {
     title: "citedTitle",
     type: "sourceType",
   },
+  sentiment: { brand: "mentionedBrand", domain: "mentionedDomain", rank: "mentionedBrandRank" },
 };
 
 function flattenAggregates(
@@ -589,7 +594,7 @@ function flattenAggregates(
 // Export Results
 // ---------------------------------------------------------------------------
 
-const METRICS: MetricType[] = ["share-of-voice", "visibility", "citations"];
+const METRICS: MetricType[] = ["share-of-voice", "visibility", "citations", "sentiment"];
 const LEVELS: EntityLevel[] = ["brand", "topic", "prompt"];
 
 type MetricRows = Record<MetricType, FlatRow[]>;
@@ -604,7 +609,7 @@ interface ExportError {
 }
 
 function createEmptyMetricRows(): MetricRows {
-  return { "share-of-voice": [], visibility: [], citations: [] };
+  return { "share-of-voice": [], visibility: [], citations: [], sentiment: [] };
 }
 
 function createExportRows(): ExportRows {
@@ -848,8 +853,9 @@ function logSummary(
     const sov = rows[level]["share-of-voice"].length;
     const vis = rows[level]["visibility"].length;
     const cit = rows[level]["citations"].length;
+    const sent = rows[level]["sentiment"].length;
     console.log(
-      `  ${label.padEnd(8)} SOV: ${sov}, Visibility: ${vis}, Citations: ${cit}`,
+      `  ${label.padEnd(8)} SOV: ${sov}, Visibility: ${vis}, Citations: ${cit}, Sentiment: ${sent}`,
     );
   }
 
